@@ -1,0 +1,4 @@
+Запуск в терминале OpenShift (в каталоге, где лежит JSONL):
+
+chmod +x run_gigachat_all_instr.sh
+./run_gigachat_all.sh               # или FILE=... ENDPOINT=... GIGA_TOKEN=... ./run_gigachat_all.sh
