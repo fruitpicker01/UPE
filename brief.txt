@@ -1,0 +1,52 @@
+from pydantic import BaseModel, Field
+from typing import List, Optional
+
+class ProductComponent(BaseModel):
+    """Компоненты продукта"""
+    productName: str = Field(description="Имя продукта")
+    description: str = Field(description="Краткое описание продукта")
+
+class StockComponents(BaseModel):
+    """Компоненты акции"""
+    startDate: str = Field(description="Дата старта акции")
+    endDate: str = Field(description="Дата окончания акции")
+    description: str = Field(description="Описание акции")
+
+class Script(BaseModel):
+    """Необязательные параметры брифа"""
+    productOffer: Optional[str] = Field(None, description="Описание оформления продукта")
+    scanLink: Optional[str] = Field(None, description="Ссылка на СберСкан")
+    targetAudience: Optional[str] = Field(None, description="Целевая аудитория")
+    calculatorLink: Optional[str] = Field(None, description="Ссылка на калькулятор")
+
+class ProductFeatures(BaseModel):
+    """Характеристики продукта Брифа"""
+    title: str = Field(description="Заголовок")
+    description: str = Field(description="Описание")
+
+class Benefits(BaseModel):
+    """Выгоды для бизнеса"""
+    title: str = Field(description="Заголовок")
+    description: str = Field(description="Описание")
+
+class ScriptBrief(BaseModel):
+    """Модель для скриптов бриф"""
+    clientsObjectionOrQuestion: str = Field(description="Возражение или вопрос клиента")
+    clientAnswer: str = Field(description="Ответ клиента")
+
+class TariffData(BaseModel):
+    """Данные тарифа"""
+    tariffName: str = Field(description="Значение тарифа")
+    tariffDescription: Optional[str] = Field(None, description="Описание тарифа")
+    tariffPrice: str = Field(description="Цена тарифа")
+
+class briefModel(BaseModel):
+    """Модель брифа"""
+    productComponent: ProductComponent = Field(description="Компоненты продукта")
+    stockComponents: Optional[List[StockComponents]] = Field(None, description="Компоненты акции")
+    script: Optional[Script] = Field(None, description="Необязательные параметры брифа")
+    productFeatures: List[ProductFeatures] = Field(description="Характеристики продукта")
+    benefitsForBusiness: List[Benefits] = Field(description="Выгоды для бизнеса")
+    scriptObjections: Optional[List[ScriptBrief]] = Field(None, description="Возражения клиентов")
+    scriptUserQuestions: Optional[List[ScriptBrief]] = Field(None, description="Вопросы клиента")
+    tariff: List[TariffData] = Field(description="Тариф")

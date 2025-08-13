@@ -1,0 +1,167 @@
+# набор промптов для генерации текста на карточках
+# входит в метод /api/v1/cards/generation
+
+def features(getCardGenRequest):
+    return "\n".join(f"- {f.title}: {f.description}" for f in getattr(getCardGenRequest.brief, 'productFeatures', []))
+
+def benefits(getCardGenRequest):
+    return "\n".join(f"- {f.title}: {f.description}" for f in getattr(getCardGenRequest.brief, 'benefitsForBusiness', []))
+
+personalization_dict = {
+    'male': 'достигайте целей, достижение целей, контролировать, обеспечить, под контролем, развивать, развитие, реализация, реализовать, управление, управлять, цель, экономить, экономия',
+    'female': 'вдохновляйтесь, комфорт, комфортный, наслаждаться, новые возможности, откройте возможности, оценить, представь, удобно',
+    'x': 'будьте уверены, легко, надёжно, надёжность, опыт, просто, проще, стабильность, стабильный, уверенно, управляйте, упростить, финансовая подушка',
+    'y': 'бонус, кешбэк, просто, простое, простота, скидка, эффективный',
+    'z': 'быстро, возможности, легко, новый, просто, простота, упростить',
+    'constructor': 'учитывать, результат, эффективность, контроль, оптимизировать',
+    'centrist': 'статус, выделяться, подчеркивать, наслаждаться',
+    'reflector': 'поддержка, команда, проверенный, значимый'
+}
+
+def pers_terms(getCardGenRequest):
+    if getCardGenRequest.personalization.gender is not None:
+        gender_terms = personalization_dict[getCardGenRequest.personalization.gender]
+    else:
+        gender_terms = ''
+    if getCardGenRequest.personalization.generation is not None:
+        age_terms = personalization_dict[getCardGenRequest.personalization.generation]
+    else:
+        age_terms = ''
+    if getCardGenRequest.personalization.psyhotype is not None:
+        psy_terms = personalization_dict[getCardGenRequest.personalization.psyhotype]
+    else:
+        psy_terms = ''
+    return gender_terms, age_terms, psy_terms
+
+def productSlideMinorCards(getCardGenRequest):
+    sub_prompt1 = f"""
+    Раскрой в виде набора тезисов в формате:
+    - заголовок
+    - описание
+    следующую информацию о продукте '{getCardGenRequest.slideContext.description}'.
+    В качестве источника используй ТОЛЬКО следующую информацию о продукте '{features(getCardGenRequest)}'.
+    Количество тезисов равно '{len(getCardGenRequest.cards)}'.
+    Для каждого тезиса из массива '{getCardGenRequest.cards}' сгенерируй:
+    - header (заголовок) — длина от '{getCardGenRequest.cards[0].minLengthHeader}' до
+    '{getCardGenRequest.cards[0].maxLengthHeader}' символов с учетом пробелов
+    - description (описание) — длина от '{getCardGenRequest.cards[0].minLengthDescription}' до
+    '{getCardGenRequest.cards[0].maxLengthDescription}' символов с учетом пробелов.
+    Обязательно используй один или несколько терминов, касающихся клиента, которому направляется этот текст,
+    из КАЖДОЙ группы:"
+    Группа 1: '{pers_terms(getCardGenRequest)[0]}'."
+    Группа 2: '{pers_terms(getCardGenRequest)[1]}'."
+    Группа 3: '{pers_terms(getCardGenRequest)[2]}'."
+    Ответь только в формате JSON-массива, пример:
+    """
+    sub_prompt2 = """
+    [
+    {
+    "number": 1,
+    "header": "...",
+    "description": "..."
+    },
+    {
+    "number": 2,
+    "header": "...",
+    "description": "..."
+    }
+    ]
+    """
+    sub_prompt3 = f"""
+    Не добавляй никаких пояснений или текста в ответе, кроме формата JSON.
+    Убедись, что информация взята только из '{getCardGenRequest.slideContext.description}' и
+    {features(getCardGenRequest)} и выводится в формате JSON-массива.
+    """
+    return sub_prompt1 + sub_prompt2 + sub_prompt3
+
+def productExtraSlide(getCardGenRequest):
+    sub_prompt1 = f"""
+    Раскрой в виде набора тезисов в формате:
+    - заголовок
+    - описание
+    следующую информацию о продукте '{getCardGenRequest.slideContext.description}'.
+    В качестве источника используй ТОЛЬКО следующую информацию о продукте '{features(getCardGenRequest)}'.
+    Количество тезисов равно '{len(getCardGenRequest.cards)}'.
+    Для каждого тезиса из массива '{getCardGenRequest.cards}' сгенерируй:
+    - header (заголовок) — длина от '{getCardGenRequest.cards[0].minLengthHeader}' до
+    '{getCardGenRequest.cards[0].maxLengthHeader}' символов с учетом пробелов
+    - description (описание) — длина от '{getCardGenRequest.cards[0].minLengthDescription}' до
+    '{getCardGenRequest.cards[0].maxLengthDescription}' символов с учетом пробелов.
+    Обязательно используй один или несколько терминов, касающихся клиента, которому направляется этот текст,
+    из КАЖДОЙ группы:"
+    Группа 1: '{pers_terms(getCardGenRequest)[0]}'."
+    Группа 2: '{pers_terms(getCardGenRequest)[1]}'."
+    Группа 3: '{pers_terms(getCardGenRequest)[2]}'."
+    Ответь только в формате JSON-массива, пример:
+    """
+    sub_prompt2 = """
+    [
+    {
+    "number": 1,
+    "header": "...",
+    "description": "..."
+    },
+    {
+    "number": 2,
+    "header": "...",
+    "description": "..."
+    }
+    ]
+    """
+    sub_prompt3 = f"""
+    Не добавляй никаких пояснений или текста в ответе, кроме формата JSON.
+    Убедись, что информация взята только из '{getCardGenRequest.slideContext.description}' и
+    {features(getCardGenRequest)} и выводится в формате JSON-массива.
+    """
+    return sub_prompt1 + sub_prompt2 + sub_prompt3
+
+def benefitsSlide(getCardGenRequest):
+    sub_prompt1 = f"""
+    Раскрой в виде набора тезисов в формате:
+    - заголовок
+    - описание
+    следующую информацию о продукте '{getCardGenRequest.slideContext.description}'.
+    В качестве источника используй ТОЛЬКО следующую информацию о продукте '{benefits(getCardGenRequest)}'.
+    Количество тезисов равно '{len(getCardGenRequest.cards)}'.
+    Для каждого тезиса из массива '{getCardGenRequest.cards}' сгенерируй:
+    - header (заголовок) — длина от '{getCardGenRequest.cards[0].minLengthHeader}' до
+    '{getCardGenRequest.cards[0].maxLengthHeader}' символов с учетом пробелов
+    - description (описание) — длина от '{getCardGenRequest.cards[0].minLengthDescription}' до
+    '{getCardGenRequest.cards[0].maxLengthDescription}' символов с учетом пробелов.
+    Обязательно используй один или несколько терминов, касающихся клиента, которому направляется этот текст,
+    из КАЖДОЙ группы:"
+    Группа 1: '{pers_terms(getCardGenRequest)[0]}'."
+    Группа 2: '{pers_terms(getCardGenRequest)[1]}'."
+    Группа 3: '{pers_terms(getCardGenRequest)[2]}'."
+    Ответь только в формате JSON-массива, пример:
+    """
+    sub_prompt2 = """
+    [
+    {
+    "number": 1,
+    "header": "...",
+    "description": "..."
+    },
+    {
+    "number": 2,
+    "header": "...",
+    "description": "..."
+    }
+    ]
+    """
+    sub_prompt3 = f"""
+    Не добавляй никаких пояснений или текста в ответе, кроме формата JSON.
+    Убедись, что информация взята только из '{getCardGenRequest.slideContext.description}' и
+    {benefits(getCardGenRequest)} и выводится в формате JSON-массива.
+    """
+    return sub_prompt1 + sub_prompt2 + sub_prompt3
+
+PROMPT_TEMPLATES = {
+    "productSlideMinorCards": productSlideMinorCards,
+    "productExtraSlide": productExtraSlide,
+    "benefitsSlide": benefitsSlide
+}
+
+def create_card_generation_personalized_prompt(getCardGenRequest):
+    fn = PROMPT_TEMPLATES.get(getCardGenRequest.thema)
+    return fn(getCardGenRequest)
