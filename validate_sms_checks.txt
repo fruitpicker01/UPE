@@ -1,0 +1,893 @@
+# validate_sms_checks.py
+# Требуется: pip install pandas openpyxl tqdm matplotlib pymorphy3
+from pathlib import Path
+import os
+import math
+import pandas as pd
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+
+# ---------- Пути ----------
+BASE = Path(r"...")
+
+TERMS_XLSX = BASE / "Термины" / "LoRA vs not LoRA terms SMS.xlsx"
+INSTR_XLSX = BASE / "Инструкции" / "LoRA vs not LoRA instr SMS.xlsx"
+
+# Названия колонок с текстами
+TERMS_LORA_COL = "LoRA terms GigaChat"
+INSTR_LORA_COL = "LoRA instr GigaChat"
+GIGACHAT_COL   = "GigaChat"
+
+# ---------- Вспомогательные утилиты ----------
+def _is_empty(val) -> bool:
+    if val is None:
+        return True
+    if isinstance(val, float) and math.isnan(val):
+        return True
+    if isinstance(val, str) and val.strip() == "":
+        return True
+    return False
+
+def run_checks_into_columns(df: pd.DataFrame,
+                            text_col: str,
+                            prefix: str,
+                            crit_checks,
+                            noncrit_checks):
+    """
+    Прогоняет проверки по df[text_col], записывает булевы колонки справа.
+    prefix = 'lora_' для LoRA-колонки, '' для GigaChat-колонки.
+    Возвращает:
+      - dict с количеством провалов по каждой крит/некрит проверке
+      - суммарные провалы (крит/некрит)
+      - количество обработанных строк
+    """
+    if text_col not in df.columns:
+        raise ValueError(f"Нет колонки '{text_col}' в Excel.")
+
+    series = df[text_col].astype(str)
+    n = len(series)
+
+    # Подготовка счётчиков
+    crit_fail_per_check    = {name: 0 for name, _ in crit_checks}
+    noncrit_fail_per_check = {name: 0 for name, _ in noncrit_checks}
+
+    # Колонки результатов добавляем по мере хода (пишем True/False)
+    # tqdm — один прогресс-бар на набор проверок для данной колонки
+    with tqdm(total=n, desc=f"Проверки для {text_col}", unit="msg") as pbar:
+        for idx, message in series.items():
+            # Пустые тексты пропускаем (ставим пусто)
+            for name, _ in crit_checks + noncrit_checks:
+                colname = f"{prefix}{name}"
+                if colname not in df.columns:
+                    df[colname] = None
+
+            if _is_empty(message):
+                pbar.update(1)
+                continue
+
+            # Критические
+            for name, func in crit_checks:
+                colname = f"{prefix}{name}"
+                try:
+                    res = to_bool(func(message))
+                    df.at[idx, colname] = bool(res)
+                    if not res:
+                        crit_fail_per_check[name] += 1
+                except Exception as e:
+                    # В случае ошибки считаем как провал
+                    df.at[idx, colname] = False
+                    crit_fail_per_check[name] += 1
+
+            # Некритические
+            for name, func in noncrit_checks:
+                colname = f"{prefix}{name}"
+                try:
+                    res = to_bool(func(message))
+                    df.at[idx, colname] = bool(res)
+                    if not res:
+                        noncrit_fail_per_check[name] += 1
+                except Exception as e:
+                    df.at[idx, colname] = False
+                    noncrit_fail_per_check[name] += 1
+
+            pbar.update(1)
+
+    total_crit_failed    = sum(crit_fail_per_check.values())
+    total_noncrit_failed = sum(noncrit_fail_per_check.values())
+    return crit_fail_per_check, noncrit_fail_per_check, total_crit_failed, total_noncrit_failed, n
+
+def print_file_stats(tag: str,
+                     lora_crit, lora_noncrit, lora_crit_total, lora_noncrit_total, rows_lora,
+                     giga_crit, giga_noncrit, giga_crit_total, giga_noncrit_total, rows_giga):
+    print(f"\n=== Итоги: {tag} ===")
+    print(f"Строк: {rows_lora} (LoRA), {rows_giga} (GigaChat)")
+
+    print(f"- Критические (LoRA):    {lora_crit_total}")
+    print(f"- Некритические (LoRA):  {lora_noncrit_total}")
+    print(f"- Критические (GigaChat):   {giga_crit_total}")
+    print(f"- Некритические (GigaChat): {giga_noncrit_total}")
+
+def plot_pair_bars(out_png: Path,
+                   title: str,
+                   order_names: list[str],
+                   lora_counts: dict,
+                   giga_counts: dict):
+    """
+    Рисует парные столбцы (LoRA vs GigaChat) для набора проверок в заданном порядке.
+    """
+    xlabels = order_names
+    lora_vals = [lora_counts.get(k, 0) for k in xlabels]
+    giga_vals = [giga_counts.get(k, 0) for k in xlabels]
+
+    import numpy as np
+    x = np.arange(len(xlabels))
+    width = 0.4
+
+    plt.figure(figsize=(max(10, len(xlabels)*0.6), 6))
+    plt.bar(x - width/2, lora_vals, width, label="LoRA")
+    plt.bar(x + width/2, giga_vals, width, label="GigaChat")
+    plt.title(title)
+    plt.xticks(x, xlabels, rotation=60, ha='right')
+    plt.ylabel("Число провалов проверки")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=160)
+    plt.close()
+    print(f"Схема сохранена: {out_png}")
+
+def process_file(xlsx_path: Path, lora_col: str, tag: str,
+                 checks_order: list[str]):
+    """
+    Прогоняет проверки для двух колонок (LoRA и GigaChat) в одном файле, сохраняет столбцы и диаграмму.
+    Возвращает сводные словари по провалам (для объединённой итоговой диаграммы).
+    """
+    if not xlsx_path.exists():
+        raise FileNotFoundError(xlsx_path)
+    print(f"\n=== Обработка файла: {xlsx_path} ===")
+
+    df = pd.read_excel(xlsx_path, engine="openpyxl")
+
+    # LoRA
+    lora_crit, lora_noncrit, lora_crit_total, lora_noncrit_total, n_lora = run_checks_into_columns(
+        df, lora_col, prefix="lora_", crit_checks=crit_checks, noncrit_checks=noncrit_checks
+    )
+    # GigaChat
+    giga_crit, giga_noncrit, giga_crit_total, giga_noncrit_total, n_giga = run_checks_into_columns(
+        df, GIGACHAT_COL, prefix="", crit_checks=crit_checks, noncrit_checks=noncrit_checks
+    )
+
+    # Сохраняем Excel с добавленными колонками
+    df.to_excel(xlsx_path, index=False, engine="openpyxl")
+    print_file_stats(tag,
+                     lora_crit, lora_noncrit, lora_crit_total, lora_noncrit_total, n_lora,
+                     giga_crit, giga_noncrit, giga_crit_total, giga_noncrit_total, n_giga)
+
+    # Диаграмма по файлу (критические+некритические вместе, по именам проверок)
+    # Склеим счётчики провалов: по каждому имени — сумма крит+некрит.
+    lora_all = {k: lora_crit.get(k,0) + lora_noncrit.get(k,0)
+                for k in set(list(lora_crit.keys()) + list(lora_noncrit.keys()))}
+    giga_all = {k: giga_crit.get(k,0) + giga_noncrit.get(k,0)
+                for k in set(list(giga_crit.keys()) + list(giga_noncrit.keys()))}
+
+    out_png = xlsx_path.with_name(xlsx_path.stem + " — диаграмма.png")
+    plot_pair_bars(out_png, f"{tag}: провалы по проверкам (LoRA vs GigaChat)",
+                   checks_order, lora_all, giga_all)
+
+    # Вернём словари для суммарной диаграммы
+    return lora_all, giga_all, (lora_crit_total, lora_noncrit_total), (giga_crit_total, giga_noncrit_total)
+
+def sum_dicts(a: dict, b: dict) -> dict:
+    keys = set(a.keys()) | set(b.keys())
+    return {k: a.get(k, 0) + b.get(k, 0) for k in keys}
+
+def main():
+    # Порядок имён проверок для оси X (чтобы везде одинаковый):
+    # Берём имена ровно в том порядке, как в ваших списках crit_checks / noncrit_checks
+    ordered_names = [name for name, _ in crit_checks] + [name for name, _ in noncrit_checks]
+
+    # Файл «Инструкции»
+    instr_lora_all, instr_giga_all, instr_totals_lora, instr_totals_giga = process_file(
+        INSTR_XLSX, INSTR_LORA_COL, tag="Инструкции",
+        checks_order=ordered_names
+    )
+
+    # Файл «Термины»
+    terms_lora_all, terms_giga_all, terms_totals_lora, terms_totals_giga = process_file(
+        TERMS_XLSX, TERMS_LORA_COL, tag="Термины",
+        checks_order=ordered_names
+    )
+
+    # Сводная диаграмма (Инструкции+Термины вместе)
+    combined_lora = sum_dicts(instr_lora_all, terms_lora_all)
+    combined_giga = sum_dicts(instr_giga_all, terms_giga_all)
+    combined_png = BASE / "Сводная — диаграмма (Инструкции+Термины).png"
+    plot_pair_bars(combined_png, "Сводная: провалы по проверкам (LoRA vs GigaChat)",
+                   ordered_names, combined_lora, combined_giga)
+
+    # Суммарные цифры по «крит/некрит» (отдельно и вместе)
+    instr_crit_total    = instr_totals_lora[0] + instr_totals_giga[0]
+    instr_noncrit_total = instr_totals_lora[1] + instr_totals_giga[1]
+    terms_crit_total    = terms_totals_lora[0] + terms_totals_giga[0]
+    terms_noncrit_total = terms_totals_lora[1] + terms_totals_giga[1]
+    both_crit_total     = instr_crit_total + terms_crit_total
+    both_noncrit_total  = instr_noncrit_total + terms_noncrit_total
+
+    print("\n=== Суммарная статистика ===")
+    print(f"- Инструкции: крит={instr_crit_total}, некрит={instr_noncrit_total}")
+    print(f"- Термины:    крит={terms_crit_total}, некрит={terms_noncrit_total}")
+    print(f"- Итого:      крит={both_crit_total}, некрит={both_noncrit_total}")
+
+# ------------------ ВСТАВКА: ФУНКЦИИ И РЕЕСТРЫ ПРОВЕРОК ------------------
+# ИМПОРТЫ ДЛЯ ПРОВЕРОК
+import re, string, logging, pymorphy3
+
+# ФУНКЦИИ ПРОВЕРОК (НАЧАЛО)
+
+ABSTRACT_PHRASES = [
+    "отличный выбор",
+    "зарабатывай больше",
+    "отличная возможность",
+    "уникальная возможность",
+    "специальная скидка",
+    "без лишних формальностей",
+    "быстро и удобно в любое время",
+    "максимальная экономия",
+    "уверенный старт",
+    "простое управление",
+    "безопасный и надёжный",
+    "надёжно и стабильно",
+    "стабильный",
+    "надежно, быстро и доступно в любое время",
+    "наслаждаясь стабильностью и надежностью",
+    "вдохновляйтесь свободой выбора!",
+    "новых высот",
+    "гибкими условиями",
+    "идеальный выбор",
+    "стабильность и комфорт",
+    "современных решений",
+    "эффективному управлению",
+    "в любой ситуации",
+    "обеспечит Вам",
+    "рост оборотов",
+    "учитывайте все выплаты",
+    "подключайтесь к удобству",
+    "безопасным управлением капиталом",
+    "забыть о хлопотах",
+    "обеспечьте",
+]
+
+CLICHE_PHRASES = [
+    "источник гордости",
+    "откройте двери",
+    "мир бесконечных возможностей",
+    "ваш успех начинается здесь",
+    "максимальная выгода",
+    "гибкие условия",
+    "наша забота",
+    "что может быть проще",
+    "заслуживает лучшего",
+    "на полную мощность",
+    "не упустите свой шанс на развитие",
+    "не упусти возможность",
+    "не упусти свой шанс",
+    "спеши",
+]
+
+morph = pymorphy3.MorphAnalyzer()
+
+def lemmatize_word(word, morph):
+    """
+    Возвращает (lemma, POS) для переданного слова.
+    """
+    parsed = morph.parse(word)
+    if not parsed:
+        return word, None
+    best = parsed[0]
+    return best.normal_form, best.tag.POS
+
+# 0. Проверка на длину
+
+def check_length(message):
+    length = len(message)
+    if 160 <= length <= 250:
+        return True
+    else:
+        logging.warning(f"Не пройдена проверка: Длина сообщения {length} символов. Сообщение: {message}")
+        return False
+
+# 1. Запрещенные слова
+
+def check_forbidden_words(message, exceptions=None):
+    """
+    Проверка на запрещённые слова.
+    Если лемма «запрещённого слова» находится в exceptions['forbidden_words'],
+    то пропускаем.
+    """
+    if exceptions is None:
+        exceptions = {}
+    allowed_lemmas = exceptions.get("forbidden_words", set())
+
+    morph = pymorphy3.MorphAnalyzer()
+    forbidden_patterns = [
+        r'№\s?1\b', r'номер\sодин\b', r'номер\s1\b',
+        r'вкусный', r'дешёвый', r'продукт',
+        r'спам', r'банкротство', r'долг[и]?', r'займ',
+        r'срочный', r'главный',
+        r'гарантия', r'успех', r'лидер', 'никакой'
+    ]
+
+    # Удаляем пунктуацию
+    message_no_punct = message.translate(str.maketrans('', '', string.punctuation))
+
+    # Пример: «бессроч» => placeholder
+    placeholder = "заменабессроч"
+    message_no_punct = re.sub(r'\b\w*бессроч\w*\b', placeholder, message_no_punct, flags=re.IGNORECASE)
+
+    # Лемматизируем все слова
+    words = message_no_punct.split()
+    lemmas = [morph.parse(w)[0].normal_form for w in words]
+    lemmas = [re.sub(r'заменабессроч', 'бессроч', l) for l in lemmas]
+    normalized_msg = ' '.join(lemmas)
+
+    # Для каждого pattern проверяем, нет ли совпадения
+    for pattern in forbidden_patterns:
+        found = re.search(pattern, normalized_msg, re.IGNORECASE)
+        if found:
+            # Получим саму найденную строку
+            matched_str = found.group(0)
+            # Лемматизируем
+            lemma_found, _ = lemmatize_word(matched_str, morph)
+            if lemma_found not in allowed_lemmas:
+                return False, f"Запрещенное слово: {matched_str}"
+
+    return True
+
+
+# 2 и #3. Обращение к клиенту и приветствие клиента
+
+def check_no_greeting(message, exceptions=None):
+    """
+    Проверка на «приветствия».
+    Если лемма слова среди exceptions['greetings'], пропускаем.
+    """
+    if exceptions is None:
+        exceptions = {}
+    allowed_lemmas = exceptions.get("greetings", set())
+
+    greeting_patterns = [
+        r"привет\b", r"здравствуй", r"добрый\s(день|вечер|утро)",
+        r"дорогой\b", r"уважаемый\b", r"дорогая\b", r"уважаемая\b",
+        r"господин\b", r"госпожа\b", r"друг\b", r"коллега\b",
+        r"товарищ\b", r"приятель\b", r"подруга\b"
+    ]
+    # Будем искать все совпадения паттернов
+    for pat in greeting_patterns:
+        match = re.search(pat, message, re.IGNORECASE)
+        if match:
+            found = match.group(0).lower()  # «дорогая», «привет» и т.п.
+            morph = pymorphy3.MorphAnalyzer()
+            lemma, pos = lemmatize_word(found, morph)
+            if lemma not in allowed_lemmas:
+                return False, f"Есть приветствие: {found}"
+    return True
+
+
+# 4. Обещания и гарантии
+
+def check_no_promises(message, exceptions=None):
+    """
+    Проверка на «обещания».
+    Если lemma слова в exceptions['promises'], то пропускаем.
+    """
+    if exceptions is None:
+        exceptions = {}
+    allowed_lemmas = exceptions.get("promises", set())
+
+    morph = pymorphy3.MorphAnalyzer()
+    patterns = ["обещать", "обещание", "гарантировать", "обязаться", "обязать", "обязательство", "обязательный"]
+
+    words = message.split()
+    lemmas = [morph.parse(w)[0].normal_form for w in words]
+
+    for patt in patterns:
+        if patt in lemmas:
+            if patt not in allowed_lemmas:
+                return False, f"Не пройдена проверка: обещания => {patt}"
+    return True
+
+
+# 5. Составные конструкции из двух глаголов
+
+def check_no_double_verbs(message, exceptions=None):
+    """
+    Проверка на 2 подряд глагола.
+    Если (lemma1, lemma2) находится в exceptions['double_verbs'], то разрешаем.
+    """
+    if exceptions is None:
+        exceptions = {}
+    allowed_pairs = exceptions.get("double_verbs", set())
+
+    morph = pymorphy3.MorphAnalyzer()
+    words = re.split(r'\s+|[.!?]', message)
+
+    tokens = [w.strip() for w in words if w.strip()]
+    parses = [morph.parse(tok)[0] for tok in tokens]
+
+    for i in range(len(parses) - 1):
+        if (parses[i].tag.POS in {'VERB', 'INFN'}) and (parses[i+1].tag.POS in {'VERB', 'INFN'}):
+            lemma1 = parses[i].normal_form
+            lemma2 = parses[i+1].normal_form
+            pair = (lemma1, lemma2)
+            # Если разрешено
+            if pair in allowed_pairs:
+                continue
+            # Если это "хотеть", "начинать", ...
+            if lemma1 in ["хотеть", "начинать", "начать"]:
+                continue
+            return False, f"Не пройдена проверка на 2 глагола подряд: {parses[i].word} {parses[i+1].word}"
+    return True
+
+
+# 6. Причастия и причастные обороты
+
+def check_no_participles(message, exceptions=None):
+    """
+    Проверка на причастия.
+    Если lemma причастия в exceptions['participles'], разрешаем.
+    """
+    if exceptions is None:
+        exceptions = {}
+    allowed_lemmas = exceptions.get("participles", set())
+
+    skip_lemmas = {"повысить", "увеличить", "понизить", "снизить"}
+
+    morph = pymorphy3.MorphAnalyzer()
+    words = message.split()
+
+    for w in words:
+        p = morph.parse(w)[0]
+        lemma = p.normal_form
+        if 'PRTF' in p.tag:
+            # Проверяем исключения
+            if lemma not in skip_lemmas and lemma not in allowed_lemmas:
+                return False, f"Не пройдена проверка на причастие: {p.word}"
+    return True
+
+
+# 7. Деепричастия и деепричастные обороты
+
+def check_no_adverbial_participles(message, exceptions=None):
+    """
+    Проверка на деепричастия.
+    Если lemma в exceptions['adverbial_participles'], то не считаем нарушением.
+    """
+    if exceptions is None:
+        exceptions = {}
+    allowed_lemmas = exceptions.get("adverbial_participles", set())
+
+    morph = pymorphy3.MorphAnalyzer()
+    words = message.split()
+    for w in words:
+        p = morph.parse(w)[0]
+        lemma = p.normal_form
+        if "GRND" in p.tag:
+            if lemma not in allowed_lemmas:
+                return False, f"Не пройдена проверка: деепричастие => {p.word}"
+    return True
+
+
+# 8. Превосходная степень прилагательных
+
+def check_no_superlative_adjectives(message, exceptions=None):
+    """
+    Проверка на превосходную степень прилагательных.
+    Если lemma прилагательного среди exceptions['superlative_adjectives'], разрешаем.
+    """
+    if exceptions is None:
+        exceptions = {}
+    allowed_lemmas = exceptions.get("superlative_adjectives", set())
+
+    morph = pymorphy3.MorphAnalyzer()
+    for w in message.split():
+        p = morph.parse(w)[0]
+        lemma = p.normal_form
+        if 'Supr' in p.tag:
+            if lemma not in allowed_lemmas:
+                return False, f"Не пройдена проверка на превосходную степень: {p.word}"
+    return True
+
+
+# 9. Страдательный залог
+
+def check_no_passive_voice(message, exceptions=None):
+    """
+    Проверка на страдательный залог.
+    Если lemma в exceptions['passive_voice'], пропускаем.
+    """
+    if exceptions is None:
+        exceptions = {}
+    allowed_lemmas = exceptions.get("passive_voice", set())
+
+    morph = pymorphy3.MorphAnalyzer()
+    words = re.findall(r'\b\w+(?:-\w+)*\b', message.lower())
+
+    for w in words:
+        p = morph.parse(w)[0]
+        lemma = p.normal_form
+        if 'pssv' in p.tag:
+            if lemma not in allowed_lemmas:
+                return False, f"Не пройдена проверка на страдательный залог: {w}"
+    return True
+
+
+# 10. Порядковые числительные от 10 прописью
+
+def check_no_written_out_ordinals(message, exceptions=None):
+    """
+    Проверка на порядковые числительные, написанные прописью (десятый и т.д.).
+    Если lemma в exceptions['written_out_ordinals'], пропускаем.
+    """
+    if exceptions is None:
+        exceptions = {}
+    allowed_lemmas = exceptions.get("written_out_ordinals", set())
+
+    morph = pymorphy3.MorphAnalyzer()
+    ordinal_words = [
+        "десятый", "одиннадцатый", "двенадцатый", "тринадцатый",
+        "четырнадцатый", "пятнадцатый", "шестнадцатый", "семнадцатый",
+        "восемнадцатый", "девятнадцатый", "двадцатый"
+    ]
+    tokens = message.split()
+    lemmas = [morph.parse(t)[0].normal_form for t in tokens]
+    for ow in ordinal_words:
+        if ow in lemmas:
+            if ow not in allowed_lemmas:
+                return False, f"Не пройдена проверка на порядковые числительные: {ow}"
+    return True
+
+
+# 11. Цепочки с придаточными предложениями
+
+def check_no_subordinate_clauses_chain(message):
+    # Регулярное выражение, которое ищет последовательности придаточных предложений
+    subordinate_clause_patterns = [
+        r'\b(который|которая|которое|которые)\b',
+        r'\b(если|потому что|так как|что|когда)\b',
+        r'\b(хотя|несмотря на то что)\b'
+    ]
+    # Разделяем сообщение на предложения по точке, вопросительному и восклицательному знакам
+    sentences = re.split(r'[.!?]\s*', message)
+
+    count = 0
+    for sentence in sentences:
+        for pattern in subordinate_clause_patterns:
+            if re.search(pattern, sentence):
+                count += 1
+
+    # Если в предложении найдено более одного придаточного предложения подряд, возвращаем False
+    if count < 2:
+        return True
+    else:
+        return False, f'Не пройдена проверка на цепочки с придаточными предложениями. Предложений: {count}'
+
+
+# 12. Разделительные повторяющиеся союзы
+
+def check_no_repeating_conjunctions(message, exceptions=None):
+    """
+    Проверка на повторяющиеся союзы 'и', 'или' и т.п.
+    Если сам союз (в лемме) в exceptions['repeating_conjunctions'], пропускаем.
+    """
+    if exceptions is None:
+        exceptions = {}
+    allowed_conjs = exceptions.get("repeating_conjunctions", set())
+
+    pattern = re.compile(r'\b(и|ни|то|не то|или|либо)\b\s*(.*?)\s*,\s*\b\1\b', re.IGNORECASE)
+    sentences = re.split(r'[.!?]\s*', message)
+    for s in sentences:
+        m = pattern.search(s)
+        if m:
+            conj = m.group(1).lower()
+            if conj not in allowed_conjs:
+                return False, f"Не пройдена проверка на повторяющиеся союзы: {s}"
+    return True
+
+
+# 13. Вводные конструкции
+
+def check_no_introductory_phrases(message, exceptions=None):
+    """
+    Проверка на вводные конструкции.
+    Если exact фраза в exceptions['introductory_phrases'], пропускаем.
+    """
+    if exceptions is None:
+        exceptions = {}
+    allowed_phrases = exceptions.get("introductory_phrases", set())
+
+    patterns = [
+        r'\b(во-первых|во-вторых|с одной стороны|по сути|по правде говоря)\b',
+        r'\b(может быть|кстати|конечно|естественно|безусловно)\b'
+    ]
+    for pat in patterns:
+        match = re.search(pat, message, re.IGNORECASE)
+        if match:
+            found = match.group(1).lower()
+            if found not in allowed_phrases:
+                return False, f"Не пройдена проверка на вводные конструкции: {found}"
+    return True
+
+
+# 14. Усилители
+
+def check_no_amplifiers(message, exceptions=None):
+    """
+    Проверка на усилители (очень, крайне...).
+    Если лемма в exceptions['amplifiers'], пропускаем.
+    """
+    if exceptions is None:
+        exceptions = {}
+    allowed_lemmas = exceptions.get("amplifiers", set())
+
+    pattern = re.compile(r'\b(очень|крайне|чрезвычайно|совсем|полностью|чисто)\b', re.IGNORECASE)
+    matches = pattern.findall(message)
+    if matches:
+        morph = pymorphy3.MorphAnalyzer()
+        for m in matches:
+            lemma, _ = lemmatize_word(m, morph)
+            if lemma not in allowed_lemmas:
+                return False, f"Не пройдена проверка на усилители: {m}"
+    return True
+
+# 15. Паразиты времени
+
+def check_no_time_parasites(message, exceptions=None):
+    """
+    Проверка на «паразиты времени» (немедленно, срочно...).
+    Если лемма в exceptions['time_parasites'], пропускаем.
+    """
+    if exceptions is None:
+        exceptions = {}
+    allowed_lemmas = exceptions.get("time_parasites", set())
+
+    pattern = re.compile(r'\b(немедленно|срочно|в данный момент)\b', re.IGNORECASE)
+    matches = pattern.findall(message)
+    if matches:
+        morph = pymorphy3.MorphAnalyzer()
+        for m in matches:
+            lemma, _ = lemmatize_word(m, morph)
+            if lemma not in allowed_lemmas:
+                return False, f"Не пройдена проверка на паразитов времени: {m}"
+    return True
+
+
+# 16. Несколько существительных подряд
+
+def check_no_multiple_nouns(message, exceptions=None):
+    """
+    Проверка на 3+ подряд существительных в рамках одного предложения,
+    учитывая, что любой знак пунктуации тоже прерывает цепочку.
+    Если конкретная цепочка лемм не в exceptions['multiple_nouns'], считаем нарушением.
+    """
+    import re
+    import pymorphy3
+
+    if exceptions is None:
+        exceptions = {}
+    allowed_chains = exceptions.get("multiple_nouns", set())
+
+    morph = pymorphy3.MorphAnalyzer()
+
+    # 1) Разбиваем весь текст на предложения по . ! ? или переводам строк
+    sentences = re.split(r'[.!?]\s*|\n+', message.strip())
+
+    for sentence in sentences:
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+
+        # 2) Внутри одного предложения извлекаем либо слово (\w+), либо "пунктуацию" ([^\w\s]+)
+        #    \w+ = буквенно-цифровая последовательность
+        #    [^\w\s]+ = "не-слово", "не-пробел" => любой набор знаков пунктуации
+        tokens = re.findall(r'\w+|[^\w\s]+', sentence)
+
+        chain = []
+        count = 0
+
+        for token in tokens:
+            # 3) Если это набор пунктуации, сбрасываем цепочку
+            if re.match(r'[^\w\s]+', token):
+                count = 0
+                chain.clear()
+                continue
+
+            # Иначе это слово => проверяем, NOUN ли это
+            p = morph.parse(token)[0]
+            if 'NOUN' in p.tag:
+                count += 1
+                chain.append(p.normal_form)
+            else:
+                count = 0
+                chain.clear()
+
+            # 4) Если встретили 3+ подряд
+            if count > 2:
+                chain_tuple = tuple(chain)
+                if chain_tuple not in allowed_chains:
+                    return False, f"Несколько существительных подряд: {chain_tuple}"
+
+    return True
+
+
+# 17. Производные предлоги
+
+def check_no_derived_prepositions(message, exceptions=None):
+    """
+    Проверка на производные предлоги.
+    Если конкретный предлог в exceptions['derived_prepositions'], пропускаем.
+    """
+    if exceptions is None:
+        exceptions = {}
+    allowed_preps = exceptions.get("derived_prepositions", set())
+
+    pattern_text = (r'\b(в течение|в ходе|вследствие|в связи с|по мере|при помощи|'
+                    r'согласно|вопреки|на основании|на случай|в продолжение|по причине|'
+                    r'вблизи|вдалеке|вокруг|внутри|вдоль|посередине|вне|снаружи|'
+                    r'благодаря|невзирая на|исходя из|благодаря)\b')
+    pat = re.compile(pattern_text, re.IGNORECASE)
+
+    matches = pat.findall(message)
+    if matches:
+        for m in matches:
+            low = m.lower()
+            if low not in allowed_preps:
+                return False, f"Не пройдена проверка на производные предлоги: {m}"
+    return True
+
+
+# 19. Сложноподчиненные предложения
+
+def check_no_compound_sentences(message, exceptions=None):
+    """
+    Проверка на отсутствие сложноподчиненных предложений.
+    Если обнаружен союз/слово, которое есть в exceptions["compound_sentences"],
+    — НЕ считаем ошибкой.
+    Если нет в исключениях, считаем ошибкой.
+    """
+    if exceptions is None:
+        exceptions = {}
+
+    # Список союзов/фраз, по которым мы определяем сложноподчинённость
+    subordinating_conjunctions = [
+        r'\bкогда\b', r'\bкак только\b', r'\bпока\b', r'\bпосле того как\b',
+        r'\bпотому что\b', r'\bтак как\b', r'\bоттого что\b', r'\bблагодаря тому что\b',
+        r'\bчтобы\b', r'\bдля того чтобы\b', r'\bесли\b', r'\bкогда бы\b', r'\bесли бы\b',
+        r'\bхотя\b', r'\bнесмотря на то что\b', r'\bбудто\b', r'\bсловно\b', r'\bкак будто\b'
+    ]
+
+    # Собираем «разрешённые» фразы (из исключений) – это сырые строки:
+    allowed_raw_phrases = exceptions.get("compound_sentences", set())
+
+    for pattern in subordinating_conjunctions:
+        # Находим все вхождения союзов
+        matches = re.finditer(pattern, message, re.IGNORECASE)
+        for m in matches:
+            raw_substring = m.group(0)  # «сырая» найденная строка
+            # Если substring НЕ в наших исключениях:
+            # (сравниваем без учёта регистра — можно .lower() )
+            if raw_substring.lower() not in (s.lower() for s in allowed_raw_phrases):
+                return (False, f'Не пройдена проверка: Сложноподчиненные предложения: {raw_substring}')
+
+    return True
+
+
+# 20. Даты прописью
+
+def check_no_dates_written_out(message, exceptions=None):
+    """
+    Проверка на даты прописью.
+    Если (lemma_ordinal, lemma_month) в exceptions['dates_written_out'], пропускаем.
+    """
+    if exceptions is None:
+        exceptions = {}
+    allowed_dates = exceptions.get("dates_written_out", set())
+
+    morph = pymorphy3.MorphAnalyzer()
+
+    months = [
+        "января", "февраля", "марта", "апреля", "мая", "июня",
+        "июля", "августа", "сентября", "октября", "ноября", "декабря"
+    ]
+    date_patterns = [
+        r'\b(первого|второго|третьего|четвертого|пятого|шестого|седьмого|'
+        r'восьмого|девятого|десятого|одиннадцатого|двенадцатого|'
+        r'тринадцатого|четырнадцатого|пятнадцатого|шестнадцатого|'
+        r'семнадцатого|восемнадцатого|девятнадцатого|двадцатого|'
+        r'двадцать первого|двадцать второго|двадцать третьего|'
+        r'двадцать четвертого|двадцать пятого|двадцать шестого|'
+        r'двадцать седьмого|двадцать восьмого|двадцать девятого|'
+        r'тридцатого|тридцать первого)\b'
+    ]
+
+    for m in months:
+        for patt in date_patterns:
+            found = re.search(f"{patt}\\s{m}", message, re.IGNORECASE)
+            if found:
+                ordinal_str = found.group(1).lower()  # например «пятнадцатого»
+                lemma_ord, _ = lemmatize_word(ordinal_str, morph)
+                lemma_month, _ = lemmatize_word(m, morph)
+                pair = (lemma_ord, lemma_month)  # («пятнадцатый», «июль»)
+                if pair not in allowed_dates:
+                    return False, f"Не пройдена проверка на даты прописью: {found.group(0)}"
+    return True
+
+# Проверка на абстракции
+def check_abstract_phrases(message, exceptions=None):
+    """
+    Критическая проверка на «абстрактные фразы» (ABSTRACT_PHRASES).
+    Если хоть одна из них найдена в тексте (регистронезависимо),
+    возвращаем (False, причина).
+    """
+    if not exceptions:
+        exceptions = {}
+    allowed_phrases = exceptions.get("abstract_phrases", set())
+
+    for phrase in ABSTRACT_PHRASES:
+        # если этой фразы нет в исключениях
+        if phrase.lower() not in allowed_phrases:
+            # проверяем, содержится ли она в сообщении
+            if phrase.lower() in message.lower():
+                return (False, f"Найдена абстрактная фраза: «{phrase}»")
+
+    return True  # если ничего не нашли
+
+# Проверка на клише
+def check_cliche(message, exceptions=None):
+    """
+    Некритическая проверка на «клише» (CLICHE_PHRASES).
+    Аналогично, если находим — (False, причина).
+    """
+    if not exceptions:
+        exceptions = {}
+    allowed_phrases = exceptions.get("cliche", set())
+
+    for phrase in CLICHE_PHRASES:
+        if phrase.lower() not in allowed_phrases:
+            if phrase.lower() in message.lower():
+                return (False, f"Найдено клише: «{phrase}»")
+
+    return True
+
+def to_bool(res):
+    return res if isinstance(res, bool) else bool(res[0])
+
+# РЕЕСТРЫ ПРОВЕРОК (имена должны совпадать с функциями)
+crit_checks = [
+    ("length_check",              check_length),
+    ("forbidden_words",           check_forbidden_words),
+    ("client_addressing",         check_no_greeting),
+    ("promises",                  check_no_promises),
+    ("subordinate_clauses_chain", check_no_subordinate_clauses_chain),
+    ("introductory_phrases",      check_no_introductory_phrases),
+    ("dates_written_out",         check_no_dates_written_out),
+    ("abstract_phrases",          check_abstract_phrases),
+]
+
+noncrit_checks = [
+    ("double_verbs",              check_no_double_verbs),
+    ("participles",               check_no_participles),
+    ("adverbial_participles",     check_no_adverbial_participles),
+    ("superlative_adjectives",    check_no_superlative_adjectives),
+    ("passive_voice",             check_no_passive_voice),
+    ("written_out_ordinals",      check_no_written_out_ordinals),
+    ("repeating_conjunctions",    check_no_repeating_conjunctions),
+    ("amplifiers",                check_no_amplifiers),
+    ("time_parasites",            check_no_time_parasites),
+    ("multiple_nouns",            check_no_multiple_nouns),
+    ("derived_prepositions",      check_no_derived_prepositions),
+    ("compound_sentences",        check_no_compound_sentences),
+    ("cliche",                    check_cliche),
+]
+# -------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    main()
