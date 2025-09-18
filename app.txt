@@ -1,0 +1,2752 @@
+import os, base64, json, time, requests, tempfile
+from io import BytesIO
+from datetime import datetime
+import pandas as pd
+import gradio as gr
+from PIL import Image
+import langchain_gigachat
+import langchain_openai
+import langchain_together
+from langchain.schema import SystemMessage, HumanMessage
+from langchain_gigachat.chat_models import GigaChat
+from langchain_openai import ChatOpenAI
+from langchain_together import ChatTogether
+from openai import OpenAI
+import openpyxl
+import re, textwrap
+from openpyxl.styles import Font, Border, Side
+import pymorphy3
+
+from bs4 import BeautifulSoup
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service as ChromeService
+from webdriver_manager.chrome import ChromeDriverManager
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+REPO = "..."
+UPLOAD_DIR = "uploads"
+REGENERATES_DIR = "regenerates"
+
+USERNAME = "..."
+PASSWORD = "..."
+
+TEMPLATE_ORDER = [
+    "Название продукта", "Суть продукта", "Суть задач", "Целевая аудитория",
+    "Функционал продукта", "Бизнес-потребность",
+    "Бизнес-ситуации, в которых продукт полезен",
+    "Как понять, что проявилась бизнес-потребность",
+    "Выгода от использования продукта",
+    "Как эффективно применить продукт", "Стоимость", "Конкуренты",
+    "Конкурентные преимущества Сбера по продукту",
+    "Информация о бизнесе клиента", "Возможные возражения клиента и ответы",
+    "Ключевое сообщение", "Оформление"
+]
+
+ALL_FIELDS = TEMPLATE_ORDER.copy()
+
+SCRIPT_SECTIONS = [
+    "Вовлечение 1",
+    "Преимущества 1","Преимущества 2", "Стоимость", "Оформление",
+    "Возражение 1","Возражение 2","Возражение 3",
+    "Возражение 4","Возражение 5","Возражение 6",
+]
+
+STRICT_MODELS = {"DeepSeek V3", "DeepSeek R1", "DeepSeek R1-0528"}
+
+THINK_RE = re.compile(r"<think>.*?</think>", re.I | re.S)
+
+LENGTH_RE = re.compile(r"\n+------\nКоличество знаков:\s*\d+\s*$", re.S)
+
+MAX_WORDS_OBJECTION = 6
+
+def _count_words(txt: str) -> int:
+
+    return len(re.findall(r'\b\w+\b', txt))
+
+def _shorten_text_via_llm(
+        model_name: str,
+        prompt_template: str,
+        src_text: str,
+        checker: callable,
+        max_try: int = 10
+) -> tuple[str, bool, str]:
+
+    if checker(src_text):
+        return src_text, False, ""
+
+    for _ in range(max_try):
+        prompt = prompt_template.format(src=src_text)
+        cand   = clean_response(call_llm(model_name, prompt))
+        if checker(cand):
+            return cand, True, prompt
+    return src_text, False, ""
+
+MAX_OBJS          = 20
+OBJS_TO_KEEP_EMPTY = 6
+
+MAX_TRY_OBJS = 10
+
+for i in range(1, MAX_OBJS + 1):
+    sec = f"Возражение {i}"
+    if sec not in SCRIPT_SECTIONS:
+        SCRIPT_SECTIONS.append(sec)
+
+OBJ_RE = re.compile(
+    r"Возражение\s*(\d+)\s*:(.*?)\s*Ответ\s*:(.*?)(?=Возражение\s*\d+\s*:|$)",
+    re.I | re.S,
+)
+
+OBJ_REPLY_TEMPLATE = (
+    "Напиши лаконичный ответ из 2-3 предложений (не более 4) суммарной длиной "
+    "**строго не более 350 знаков с пробелами** на следующее возражение клиента: «{obj}».\n"
+    "Название продукта: {name}\n"
+    "Суть продукта: {essence}\n"
+    "Функционал продукта:\n{func}\n"
+    "Выгода от использования продукта:\n{benefit}\n"
+    "Как эффективно применить продукт:\n{how_apply}\n"
+    "Стоимость:\n{cost}\n"
+    "Конкурентные преимущества Сбера по продукту:\n{advantage}\n"
+    "Информация о бизнесе клиента:\n{biz}\n"
+    "Ключевая информация: {key_msg}\n"
+    "Стиль – деловой, без восклицаний.\n"
+    "Убедись, что все факты в ответе соответствуют исходным данным.\n"
+    "Ответь только требуемым абзацем."
+)
+
+MAX_LEN_GENERAL = 350
+MAX_LEN_ENGAGEMENT = 300
+MAX_LEN_COST_DESIGN = 300
+MAX_LEN_ADVANTAGES = 500
+
+def _is_blank(x: str) -> bool:
+    return x is None or not x.strip()
+
+def _get_prompt_line(label: str, value: str) -> str:
+
+    if _is_blank(value):
+        return ""
+
+    return f"{label}:\n{value}\n"
+
+def _get_advantage1_content(advantage: str, benefit: str, essence: str) -> str:
+
+    if not _is_blank(advantage):
+        return _get_prompt_line("Конкурентные преимущества Сбера по продукту", advantage)
+    elif not _is_blank(benefit):
+        return _get_prompt_line("Выгода от использования продукта", benefit)
+    else:
+        return _get_prompt_line("Суть продукта", essence)
+
+def _get_advantage2_content(func: str, benefit: str, essence: str) -> str:
+
+    if not _is_blank(func):
+        return _get_prompt_line("Функционал продукта", func)
+    elif not _is_blank(benefit):
+        return _get_prompt_line("Выгода от использования продукта", benefit)
+    else:
+        return _get_prompt_line("Суть продукта", essence)
+
+def _build_answer_prompt(objection: str,
+                         name: str, essence: str, func: str, benefit: str,
+                         how_apply: str, cost: str, advantage: str,
+                         biz: str, key_msg: str) -> str:
+
+    body = "".join([
+        _get_prompt_line("Название продукта", name),
+        _get_prompt_line("Суть продукта", essence),
+        _get_prompt_line("Функционал продукта", func),
+        _get_prompt_line("Выгода от использования продукта", benefit),
+        _get_prompt_line("Как эффективно применить продукт", how_apply),
+        _get_prompt_line("Стоимость", cost),
+        _get_prompt_line("Конкурентные преимущества Сбера по продукту", advantage),
+        _get_prompt_line("Информация о бизнесе клиента", biz),
+        _get_prompt_line("Ключевая информация", key_msg),
+    ])
+    return (
+        f"Напиши лаконичный ответ из 2-3 предложений (не более 4) суммарной длиной "
+        f"**строго не более 350 знаков с пробелами** на следующее возражение клиента: «{objection}».\n"
+        f"{body}"
+        "Стиль – деловой, без восклицаний.\n"
+        "Убедись, что все факты в ответе соответствуют исходным данным.\n"
+        "Ответь только требуемым абзацем."
+    )
+
+def _build_answer_prompt_structured(objection: str,
+                                    name: str, essence: str, func: str, benefit: str,
+                                    how_apply: str, cost: str, advantage: str,
+                                    biz: str, key_msg: str) -> str:
+
+    body = "".join([
+        _get_prompt_line("Название продукта", name),
+        _get_prompt_line("Суть продукта", essence),
+        _get_prompt_line("Функционал продукта", func),
+        _get_prompt_line("Выгода от использования продукта", benefit),
+        _get_prompt_line("Как эффективно применить продукт", how_apply),
+        _get_prompt_line("Стоимость", cost),
+        _get_prompt_line("Конкурентные преимущества Сбера по продукту", advantage),
+        _get_prompt_line("Информация о бизнесе клиента", biz),
+        _get_prompt_line("Ключевая информация", key_msg),
+    ])
+    return (
+        f"Напиши лаконичный ответ из 2-3 предложений (не более 4) суммарной длиной "
+        f"**строго не более 350 знаков с пробелами** на следующее возражение клиента: «{objection}» "
+        f"по принципу «Понимаю → Объясняю → Предлагаю».\n"
+        f"{body}"
+        "Структура ответа:\n"
+        "1) Понимаю – покажи сочувствие к ситуации.\n"
+        "2) Объясняю – кратко раскрой, как продукт решает боль (1-2 выгоды без цифр-давления).\n"
+        "3) Предлагаю – мягко пригласи к диалогу («Могу прислать пример…?»).\n"
+        "Стиль – деловой, без восклицаний.\n"
+        "Тон: уважительный, заботливый; избегай слов «должны/обязаны» и агрессивных призывов.\n"
+        "Убедись, что все факты в ответе соответствуют исходным данным.\n"
+        "Ответь только требуемым абзацем."
+    )
+
+def parse_task_essences(raw: str) -> list[str] | None:
+
+    if not raw or not raw.strip():
+        return []
+
+    pattern = r"Суть задачи\s*(\d+)\s*:\s*(.+?)(?=Суть задачи\s*\d+\s*:|$)"
+    matches = re.findall(pattern, raw, re.IGNORECASE | re.DOTALL)
+
+    if not matches:
+        return None
+
+    tasks = []
+    expected_num = 1
+
+    for num_str, task_text in matches:
+        num = int(num_str)
+        if num != expected_num:
+            return None
+
+        task_text = task_text.strip()
+        if not task_text:
+            return None
+
+        tasks.append(task_text)
+        expected_num += 1
+
+    return tasks
+
+def parse_objections(raw: str, *, max_items: int = 15) -> list[str] | None:
+    if not raw or not raw.strip():
+        return []
+
+    lines = raw.splitlines()
+    res, cur_num, cur_v, cur_a, mode = [], None, [], [], None
+
+    for ln in lines:
+        ln_stripped = ln.strip()
+
+        m_num = re.match(r"^Возражение\s*(\d+)\s*:(.*)", ln_stripped, re.I)
+        if m_num:
+
+            if cur_num is not None:
+                res.append(
+                    f"Возражение {cur_num}: {' '.join(cur_v).strip()}\n"
+                    f"Ответ: {' '.join(cur_a).strip()}"
+                )
+            cur_num = int(m_num.group(1))
+            cur_v, cur_a = [m_num.group(2).strip()], []
+            mode = "V"
+            continue
+
+        m_ans = re.match(r"^Ответ\s*:(.*)", ln_stripped, re.I)
+        if m_ans:
+            cur_a = [m_ans.group(1).strip()]
+            mode = "A"
+            continue
+
+        if mode == "V":
+            cur_v.append(ln_stripped)
+        elif mode == "A":
+            cur_a.append(ln_stripped)
+
+    if cur_num is not None:
+        res.append(
+            f"Возражение {cur_num}: {' '.join(cur_v).strip()}\n"
+            f"Ответ: {' '.join(cur_a).strip()}"
+        )
+
+    nums = [int(re.match(r"Возражение (\d+):", r).group(1)) for r in res]
+    if nums != list(range(1, len(nums) + 1)):
+        return None
+
+    return res[:max_items]
+
+def _parse_six_objections(raw_text: str) -> list[str] | None:
+
+    items = []
+
+    m_ptrn = re.compile(r"^\s*(\d+)\s*[\)\.\:\-–—]\s*(.+?)\s*$", re.MULTILINE)
+
+    matches = m_ptrn.findall(raw_text)
+
+    if len(matches) < 6:
+        return None
+
+    try:
+        nums = [int(num) for num, txt in matches]
+        if nums[:6] != [1, 2, 3, 4, 5, 6]:
+            return None
+
+        return [txt.strip() for num, txt in matches[:6]]
+    except (ValueError, IndexError):
+        return None
+
+def process_all_objections(
+        raw_original_objections: str,
+        llm_name: str,
+        detect_prompt: str,
+        name: str, essence: str, func: str, benefit: str,
+        how_apply: str, cost: str, advantage: str, biz: str, key_msg: str
+    ):
+
+    matches = list(OBJ_RE.finditer(raw_original_objections or ""))
+    nums    = [int(m.group(1)) for m in matches]
+    if not matches or nums != list(range(1, len(nums)+1)):
+        gr.Warning(
+            "Проверьте поле «Возможные возражения клиента и ответы». "
+            "Оно должно иметь формат – "
+            "Возражение 1: … Ответ: … Возражение 2: … Ответ: … и т.д."
+        )
+        matches = []
+
+    original_items: list[dict] = []
+
+    obj_prompt_tpl = (
+        "Сократи следующий текст без потери общего смысла "
+        "**строго до 6 слов или меньше**: {src}\n"
+        "Ответь только требуемым текстом."
+    )
+    ans_prompt_tpl = (
+        "Сократи следующий текст без потери общего смысла до 2-3 предложений "
+        "(не более 4) суммарной длиной **строго не более 350 знаков с пробелами**: {src}\n"
+        ""
+        "НИ В КОЕМ СЛУЧАЕ не добавляй факты, которых нет в исходном тексте.\n"
+        "Ответь только требуемым текстом."
+    )
+
+    for m in matches:
+        num       = int(m.group(1))
+        obj_raw   = m.group(2).strip()
+        ans_raw   = m.group(3).strip()
+
+        obj_fin, obj_changed, obj_prompt = _shorten_text_via_llm(
+            llm_name, obj_prompt_tpl, obj_raw,
+            lambda t: _count_words(t) <= MAX_WORDS_OBJECTION
+        )
+        if obj_changed: print("[OBJ_PROMPT]", obj_prompt)
+
+        if len(ans_raw) > MAX_LEN_GENERAL:
+
+            structured_prompt = _build_answer_prompt_structured(
+                obj_fin, name, essence, func, benefit,
+                how_apply, cost, advantage, biz, key_msg
+            )
+            ans_fin = single_llm(llm_name, structured_prompt, essence, func, benefit, how_apply, cost, advantage, biz, key_msg)
+            ans_changed = True
+            ans_prompt = structured_prompt
+            print("[STRUCTURED_ANS_PROMPT]", ans_prompt)
+        else:
+            ans_fin, ans_changed, ans_prompt = ans_raw, False, ""
+
+        obj_hdr = f"Возражение {num}"
+        if obj_changed:
+            obj_hdr += " (переформулировано LLM)"
+        ans_hdr = "Ответ"
+        if ans_changed:
+            ans_hdr += " (переформулировано LLM) [Понимание]"
+
+        final_txt = (
+            f"{obj_hdr}: {obj_fin}\n"
+            f"{ans_hdr}: {ans_fin}\n\n"
+            f"------\nКоличество знаков в ответе: {len(ans_fin)}"
+        )
+
+        if ans_changed:
+            answer_prompt_full = ans_prompt
+        else:
+            answer_prompt_full = _build_answer_prompt(
+                obj_fin, name, essence, func, benefit,
+                how_apply, cost, advantage, biz, key_msg
+            )
+
+        original_items.append({
+            "text":   final_txt,
+            "prompt": answer_prompt_full,
+            "unlock": True
+        })
+
+    total_orig = len(original_items)
+
+    name, essence, func, benefit, how_apply, cost, advantage, biz, key_msg = [
+        ensure_period(t) for t in
+        [name, essence, func, benefit, how_apply, cost, advantage, biz, key_msg]
+    ]
+    all_sources = (essence, func, benefit, how_apply, cost, advantage, biz, key_msg)
+
+    new_questions = None
+    if detect_prompt and not detect_prompt.startswith("Промпт для определения"):
+        gr.Info("Генерация 6 новых возражений…")
+        for _ in range(1, MAX_TRY_OBJS + 1):
+            raw = single_llm(llm_name, detect_prompt, *all_sources)
+            new_questions = _parse_six_objections(raw)
+            if new_questions: break
+        if not new_questions:
+            gr.Warning("Не удалось сгенерировать 6 корректных возражений.")
+    new_questions = new_questions or []
+
+    new_objections_full = []
+    for i, q in enumerate(new_questions):
+        gr.Info(f"Генерация ответа на: «{q[:30]}…»")
+
+        use_structured = (i + 1) % 3 == 0
+
+        if use_structured:
+            reply_prompt = _build_answer_prompt_structured(
+                q, name, essence, func, benefit,
+                how_apply, cost, advantage, biz, key_msg
+            )
+        else:
+            prompt_body = "".join([
+                _get_prompt_line(l, v) for l, v in [
+                    ("Название продукта", name), ("Суть продукта", essence),
+                    ("Функционал продукта", func), ("Выгода от использования продукта", benefit),
+                    ("Как эффективно применить продукт", how_apply), ("Стоимость", cost),
+                    ("Конкурентные преимущества Сбера по продукту", advantage),
+                    ("Информация о бизнесе клиента", biz), ("Ключевая информация", key_msg)
+            ] ])
+            reply_prompt = (
+                f"Напиши лаконичный ответ из 2-3 предложений (не более 4) суммарной длиной "
+                f"**строго не более 350 знаков с пробелами** на следующее возражение клиента: «{q}».\n"
+                f"{prompt_body}"
+                "Стиль – деловой, без восклицаний.\n"
+                "Убедись, что все факты в ответе соответствуют исходным данным.\n"
+                "Ответь только требуемым абзацем."
+            )
+
+        answer = single_llm(llm_name, reply_prompt, *all_sources)
+
+        answer_label = "Ответ (придумано LLM)"
+        if use_structured:
+            answer_label += " [Понимание]"
+
+        full_text = (
+            f"Возражение (придумано LLM): {q}\n"
+            f"{answer_label}: {answer}\n\n"
+            f"------\nКоличество знаков в ответе: {len(answer)}"
+        )
+        new_objections_full.append({"text": full_text, "prompt": reply_prompt})
+
+    gr.Info("✔️ Обработка возражений завершена.")
+
+    total_visible = total_orig + len(new_objections_full)
+
+    row_updates            = [gr.update(visible=(i < total_visible)) for i in range(MAX_OBJS)]
+    box_updates            = [gr.update(value="")] * MAX_OBJS
+    btn_updates            = [gr.update(interactive=True)] * MAX_OBJS
+    hidden_prompt_updates  = [gr.update(value="")] * MAX_OBJS
+    llm_prompt_box_updates = [gr.update(value="")] * 6
+
+    for i, itm in enumerate(original_items):
+        box_updates[i]   = gr.update(value=itm["text"], interactive=True)
+        btn_updates[i]   = gr.update(interactive=itm["unlock"])
+        hidden_prompt_updates[i] = gr.update(value=itm["prompt"])
+
+    for j, itm in enumerate(new_objections_full, start=total_orig):
+        box_updates[j]   = gr.update(value=itm["text"], interactive=True)
+        hidden_prompt_updates[j] = gr.update(value=itm["prompt"])
+        if j-total_orig < len(llm_prompt_box_updates):
+            llm_prompt_box_updates[j-total_orig] = gr.update(value=itm["prompt"])
+
+    return tuple(row_updates + box_updates + btn_updates +
+                 llm_prompt_box_updates + hidden_prompt_updates)
+
+def single_llm(model_name: str, prompt: str, *sources: str) -> str:
+
+    raw = call_llm(model_name, prompt)
+    return postprocess_llm(raw, *sources)
+
+def retry_llm(model_name: str,
+              prompt: str,
+              *sources: str,
+              max_try: int = 10,
+              max_len: int = MAX_LEN_GENERAL
+              ) -> str:
+
+    for attempt in range(1, max_try + 1):
+        raw  = call_llm(model_name, prompt)
+        resp = postprocess_llm(raw, *sources)
+        length_ok = len(resp) <= max_len
+        bullets   = resp.count("✔️")
+
+        if length_ok and bullets != 1:
+            return resp
+
+    return (f"Не удалось получить сообщение ≤ {max_len} знаков и без одиночного "
+            "буллита за 10 попыток")
+
+def strip_length(text: str) -> str:
+
+    if not text:
+        return ""
+    return LENGTH_RE.sub("", text).rstrip()
+
+def with_length(text: str) -> str:
+
+    return f"{text}\n\n------\nКоличество знаков: {len(text)}"
+
+_gc_key   = os.getenv("GC_KEY_CORP")
+_openai   = os.getenv("GPT_KEY")
+_together = os.getenv("TOGETHER_KEY")
+
+_gc_common = dict(
+    credentials=_gc_key,
+    temperature=1.15,
+    verify_ssl_certs=False,
+    scope="GIGACHAT_API_CORP"
+)
+
+chat_pool: dict[str, callable] = {
+
+    "GigaChat-2-Max":          lambda: GigaChat(model="GigaChat-2-Max", **_gc_common),
+
+    "ChatGPT-4o": lambda: ChatOpenAI(api_key=_openai,  model="gpt-4o"),
+    "DeepSeek V3": lambda: ChatTogether(api_key=_together,
+                                        model="deepseek-ai/DeepSeek-V3"),
+    "DeepSeek R1-0528": lambda: ChatTogether(api_key=_together,
+                                        model="deepseek-ai/DeepSeek-R1")
+}
+
+def maybe_with_length(text: str) -> str:
+
+    if text.startswith("Не удалось создать за 10"):
+        return text
+    return with_length(text)
+
+def call_llm(model_name: str, prompt: str) -> str:
+
+    if model_name not in chat_pool:
+        return f"Неизвестная модель: {model_name}"
+
+    client = chat_pool[model_name]
+
+    if not hasattr(client, "invoke"):
+        client = client()
+        chat_pool[model_name] = client
+
+    try:
+        res = client.invoke(
+            [SystemMessage(content=""), HumanMessage(content=prompt)]
+        )
+        return res.content.strip()
+    except Exception as e:
+        return f"⚠️ Ошибка обращения к {model_name}: {e}"
+
+def refine_section(model_name: str,
+                   base_prompt: str,
+                   prev_answer: str,
+                   clarification: str,
+                   *sources: str
+                   ):
+
+    if base_prompt.startswith("Промпт для стоимости не сформирован"):
+        msg = "Блок не сформирован, поскольку в брифе отсутствует информация о стоимости."
+        return (
+            gr.update(value=msg, interactive=True),
+            gr.update(value="")
+        )
+    if base_prompt.startswith("Промпт для оформления не сформирован"):
+        msg = "Блок не сформирован, поскольку отсутствует информация об оформлении."
+        return (
+            gr.update(value=msg, interactive=True),
+            gr.update(value="")
+        )
+
+    strict = model_name in STRICT_MODELS
+    clarification = clarification.strip()
+
+    has_care_label = prev_answer.startswith("[Забота]")
+
+    prev_clean = strip_length(prev_answer)
+
+    if clarification:
+        full_prompt = build_refine_prompt(
+            base_prompt, prev_clean, clarification,
+            strict_postfix=strict
+        )
+    else:
+        full_prompt = base_prompt.strip()
+
+    is_cost   = base_prompt.startswith("Промпт для стоимости")
+    is_format = base_prompt.startswith("Промпт для оформления")
+    is_advantages = "преимущества" in base_prompt.lower() or "преимуществ" in base_prompt.lower()
+    is_engagement = ("вовлечение" in base_prompt.lower() or
+                    "суть задач" in base_prompt.lower() or
+                    "суть задачи" in base_prompt.lower())
+
+    if is_cost or is_format:
+        limit = MAX_LEN_COST_DESIGN
+    elif is_advantages:
+        limit = MAX_LEN_ADVANTAGES
+    elif is_engagement:
+        limit = MAX_LEN_ENGAGEMENT
+    else:
+        limit = MAX_LEN_GENERAL
+
+    answer = retry_llm(model_name, full_prompt, *sources, max_len=limit)
+
+    if has_care_label:
+        answer = f"[Забота] {answer}"
+
+    answer_ui = maybe_with_length(answer)
+
+    try:
+        save_regenerate_json(
+            section=base_prompt.splitlines()[0].split(":")[0]
+                              .replace("Промпт для ", "")
+                              .capitalize(),
+            prompt=base_prompt,
+            old_resp=prev_clean,
+            clarification=clarification,
+            new_resp=answer
+        )
+        save_regenerate_to_excel(
+            section=base_prompt.splitlines()[0].split(":")[0]
+                              .replace("Промпт для ", "")
+                              .capitalize(),
+            prompt=base_prompt,
+            old_resp=prev_clean,
+            clarification=clarification,
+            new_resp=answer
+        )
+    except Exception as exc:
+        gr.Warning(f"Не удалось сохранить логи перегенерации: {exc}")
+
+    return (
+        gr.update(value=answer_ui, interactive=True),
+        gr.update(value="")
+    )
+
+def refine_llm_objection(model_name, base_prompt, scr_tb, clar_tb):
+
+    prev_answer    = scr_tb
+    clarification  = clar_tb.strip()
+
+    lines   = prev_answer.splitlines()
+    header  = lines[0]
+
+    ans_idx = next((i for i,l in enumerate(lines) if l.lower().startswith("ответ")), 1)
+
+    ans_line = lines[ans_idx] if ans_idx < len(lines) else ""
+    has_understanding = "[Понимание]" in ans_line
+
+    old_ans = " ".join(lines[ans_idx:]).split("------")[0].strip()
+    objection_txt = header.split(":",1)[1].strip()
+
+    if clarification:
+        prompt = build_refine_prompt(base_prompt, old_ans, clarification)
+    else:
+        prompt = base_prompt.strip()
+
+    raw   = call_llm(model_name, prompt)
+    ans   = clean_response(raw)
+    if len(ans) > MAX_LEN_GENERAL:
+        ans = ans[:MAX_LEN_GENERAL]
+
+    ans_label = "Ответ (переформулировано LLM)"
+    if has_understanding:
+        ans_label += " [Понимание]"
+
+    new_block = (
+        f"{header}\n"
+        f"{ans_label}: {ans}\n\n"
+        f"------\nКоличество знаков в ответе: {len(ans)}"
+    )
+
+    return (
+        gr.update(value=new_block, interactive=True),
+        gr.update(value="")
+    )
+
+morph = pymorphy3.MorphAnalyzer()
+
+NUM_RE  = r'([0-9]+(?:[.,][0-9]+)?)'
+UNIT_RE = r'(\s*[%₽]|[а-яА-ЯёЁ]+)?'
+
+def _norm_num(num: str) -> str:
+
+    return str(float(num.replace(',', '.'))).rstrip('0').rstrip('.')
+
+def _norm_unit(unit: str) -> str:
+    u = unit.strip().lower()
+
+    if u in {'%', 'процент', 'процентов'}: return '%'
+    if not u:
+        return '%'
+    return morph.parse(u)[0].normal_form
+
+def fix_limit_wording(text: str, *sources: str) -> str:
+
+    ref_pairs: set[tuple[str, str]] = set()
+    patt_ref = re.compile(
+        r'\bдо\s+([0-9]+(?:[.,][0-9]+)?)\s*(%|₽|[A-Za-zА-Яа-яёЁ]+)?',
+        re.I
+    )
+    for src in filter(None, sources):
+        for m in patt_ref.finditer(src):
+            ref_pairs.add((_norm_num(m.group(1)),
+                           _norm_unit(m.group(2) or '')))
+
+    if not ref_pairs:
+        return text
+
+    patt_gen = re.compile(
+        r'\b(от|за)\s+([0-9]+(?:[.,][0-9]+)?)\s*(%|₽|[A-Za-zА-Яа-яёЁ]+)?',
+        re.I
+    )
+
+    def _repl(m: re.Match) -> str:
+        num_raw, unit_raw = m.group(2), (m.group(3) or '')
+        pair = (_norm_num(num_raw), _norm_unit(unit_raw))
+        if pair in ref_pairs:
+
+            if unit_raw.strip() in {'%', '₽'}:
+                return f'до {num_raw}{unit_raw}'
+            space = ' ' if unit_raw else ''
+            return f'до {num_raw}{space}{unit_raw}'
+        return m.group(0)
+
+    return patt_gen.sub(_repl, text)
+
+def postprocess_llm(raw_resp: str, *sources: str) -> str:
+
+    if '%%' in raw_resp or re.search(r'(?<!\d)%[\s.,:;!?]', raw_resp):
+        print("[DEBUG %-issue BEFORE]", raw_resp)
+
+    txt = clean_response(raw_resp)
+    txt = fix_limit_wording(txt, *sources)
+
+    txt = re.sub(r'%%+', '%', txt)
+
+    txt = re.sub(r'(?<!\d)%(?=[\s.,:;!?]|$)', '', txt)
+
+    if '%%' in txt or re.search(r'(?<!\d)%[\s.,:;!?]', txt):
+        print("[DEBUG %-issue AFTER ]", txt)
+
+    print("[FINAL ]:", txt.replace("\n", "⏎"))
+
+    return txt
+
+def gh_headers():
+    token = os.getenv("GITHUB_TOKEN")
+    h = {"Accept": "application/vnd.github+json"}
+    if token: h["Authorization"] = f"token {token}"
+    return h
+
+def gh_read(path:str)->bytes:
+    url=f"https://api.github.com/repos/{REPO}/contents/{path}"
+    r=requests.get(url,headers=gh_headers(),timeout=15); r.raise_for_status()
+    return base64.b64decode(r.json()["content"])
+
+def gh_write(path: str, data: bytes, msg: str, sha: str | None = None):
+    url  = f"https://api.github.com/repos/{REPO}/contents/{path}"
+    body = {
+        "message": msg,
+        "content": base64.b64encode(data).decode()
+    }
+    if sha:
+        body["sha"] = sha
+    r = requests.put(url, headers=gh_headers(), data=json.dumps(body), timeout=15)
+    if r.status_code not in (200, 201):
+        raise gr.Warning(f"GitHub error {r.status_code}: {r.text}")
+
+def gh_image(path: str) -> Image.Image:
+
+    data = gh_read(path)
+    return Image.open(BytesIO(data))
+
+def download_template():
+
+    bin_data = gh_read("Шаблон для брифа.xlsx")
+    tmp_dir  = tempfile.mkdtemp()
+    path     = os.path.join(tmp_dir, "Шаблон для брифа.xlsx")
+    with open(path, "wb") as f:
+        f.write(bin_data)
+    return gr.update(value=path, visible=True)
+
+def parse_excel(binary: bytes):
+    df = pd.read_excel(BytesIO(binary), header=None, engine="openpyxl")
+
+    df[1] = df[1].apply(lambda x: "" if pd.isna(x) else x)
+    mapping = dict(zip(df[0], df[1]))
+    return [
+        gr.update(value=mapping.get(k, ""), interactive=True)
+        for k in TEMPLATE_ORDER
+    ]
+
+def fill_fields(choice):
+    if choice == "Свой продукт":
+        return [gr.update(value="", interactive=True) for _ in boxes]
+
+    file_name = f"{choice}.xlsx"
+    try:
+        bin_data = gh_read(file_name)
+        return parse_excel(bin_data)
+    except Exception as e:
+        return [gr.update(value="", interactive=True) for _ in boxes]
+
+def upload_and_fill(xlsx_file):
+
+    if xlsx_file is None:
+        return [gr.update()] * 14
+
+    try:
+        df = pd.read_excel(xlsx_file, header=None, engine="openpyxl")
+    except Exception as e:
+        gr.Warning(f"Не удалось прочитать Excel: {e}")
+        return [gr.update()] * 14
+
+    if df[0].tolist() != TEMPLATE_ORDER:
+        gr.Warning("Файл не совпадает с шаблоном. Проверьте!")
+        return [gr.update()] * 14
+
+    binary = open(xlsx_file, "rb").read()
+    try:
+        base_name = os.path.splitext(os.path.basename(xlsx_file))[0]
+        unix = int(time.time())
+        gh_write(f"{UPLOAD_DIR}/{base_name}_{unix}.xlsx",
+                 binary,
+                 f"upload {base_name}.xlsx {unix}")
+    except Exception as e:
+        gr.Warning(f"Не удалось сохранить на GitHub: {e}")
+
+    return parse_excel(binary)
+
+def regenerate(sec,clar):
+    return f"🔄 {sec} (обновлено {datetime.now():%H:%M:%S})"
+
+def change_tab(idx:int): return gr.update(selected=idx)
+
+def restore_yo(text: str) -> str:
+    morph = pymorphy3.MorphAnalyzer()
+
+    def fix_word(word: str) -> str:
+
+        if not re.search(r'[А-Яа-яЁё]', word):
+            return word
+        if word.isupper() or word.lower() == "все":
+            return word
+        parsed = morph.parse(word)[0]
+        restored = parsed.word
+
+        if word and word[0].isupper():
+            restored = restored.capitalize()
+        return restored
+
+    tokens = re.split(r'(\s+)', text)
+    tokens = [fix_word(tok) if not tok.isspace() else tok for tok in tokens]
+    return ''.join(tokens)
+
+def clean_response(txt: str) -> str:
+
+    if not txt:
+        return ""
+
+    txt = THINK_RE.sub("", txt)
+
+    lines = [l.rstrip() for l in txt.splitlines() if l.strip()]
+
+    bullet_in   = re.compile(r"^\s*[•·—-]\s*")
+    bullet_out  = "✔️ "
+    first_up    = re.compile(r"^(\s*✔️\s*)([A-ZА-ЯЁ])")
+    glued_last  = re.compile(
+        r"^(\s*✔️\s*)([^.;]+?)([.;])\s+([A-ZА-ЯЁ].+)$"
+    )
+    tail_punct  = re.compile(r"[.;]\s*$")
+
+    processed = []
+    for line in lines:
+        line = bullet_in.sub(bullet_out, line)
+
+        m = first_up.match(line)
+        if m:
+            line = f"{m.group(1)}{m.group(2).lower()}{line[m.end(2):]}"
+
+        g = glued_last.match(line)
+        if g:
+            processed.append(f"{g.group(1)}{g.group(2).strip()}")
+            processed.append(g.group(4).strip())
+            continue
+
+        if line.lstrip().startswith("✔️"):
+            line = tail_punct.sub("", line)
+
+        processed.append(line)
+
+    fixed = []
+    for ln in processed:
+        if ln.lstrip().startswith("✔️") and "✔️" in ln.lstrip()[1:]:
+            ln = re.sub(r'\s+✔️\s*', r'\n✔️ ', ln).strip()
+        fixed.extend(ln.splitlines())
+    processed = fixed
+
+    dedup = []
+    for ln in processed:
+        if not dedup or ln.strip() != dedup[-1].strip():
+            dedup.append(ln)
+    processed = dedup
+
+    txt_out = "\n".join(processed)
+    txt_out = restore_yo(txt_out)
+    txt_out = re.sub(r"YouKassa|YooKassa|Ykassa", "Юkassa", txt_out)
+    txt_out = re.sub(r"купер", "Купер", txt_out)
+    txt_out = re.sub(r"ашан", "Ашан", txt_out)
+    txt_out = re.sub(r"лента", "Лента", txt_out)
+    txt_out = re.sub(r"комус", "Комус", txt_out)
+    txt_out = re.sub(r"комуса", "Комус", txt_out)
+    txt_out = re.sub(r"Дом.рф", "Дом.РФ", txt_out)
+    txt_out = re.sub(r"Дом.рф", "Дом.РФ", txt_out)
+    txt_out = re.sub(r"сберлизинг", "СберЛизинг", txt_out)
+    txt_out = re.sub(r"Сбербизнес.жкх", "СберБизнес.ЖКХ", txt_out)
+    txt_out = re.sub(r"сбербизнес.жкх", "СберБизнес.ЖКХ", txt_out)
+    txt_out = re.sub(r"Сбербанк.бизнес.жкх", "СберБизнес.ЖКХ", txt_out)
+    txt_out = re.sub(r"Sms", "SMS", txt_out)
+    txt_out = re.sub(r"sberPay", "SberPay", txt_out)
+    txt_out = re.sub(r"qr", "QR", txt_out)
+    txt_out = re.sub(r'\s[-–—]\s', ' — ', txt_out)
+    txt_out = re.sub(r'(?<=\d)[-–—](?=\d)', '–', txt_out)
+    txt_out = re.sub(r'(?<=[A-Za-zА-Яа-я0-9])[-–—](?=[A-Za-zА-Яа-я0-9])', '-', txt_out)
+    txt_out = re.sub(r'(\*|_|`)+', '', txt_out)
+    txt_out = re.sub(r'[\"\'«»“”„‟‹›‘’‚‛]', '', txt_out)
+
+    return txt_out.strip()
+
+def build_refine_prompt(base_prompt: str,
+                        prev_answer: str,
+                        clarification: str,
+                        strict_postfix: bool = False) -> str:
+
+    blocks = [
+        "User:",
+        base_prompt.strip(),
+        "",
+        "Assistant:",
+        clean_response(prev_answer),
+        "",
+        "User:",
+        clarification.strip(),
+        "",
+        "Assistant:"
+    ]
+    prompt = "\n".join(blocks)
+    return prompt
+
+def save_comment_json(comment: str):
+
+    ts = int(time.time())
+    payload = {
+        "timestamp": ts,
+        "comment": comment or "(пусто)"
+    }
+    gh_write(
+        f"comments/comment_{ts}.json",
+        json.dumps(payload, ensure_ascii=False, indent=2).encode(),
+        f"add comment {ts}"
+    )
+
+def save_comment_to_excel(comment: str):
+    cols = ["timestamp", "comment"]
+    ts   = int(time.time())
+
+    try:
+        meta = requests.get(
+            f"https://api.github.com/repos/{REPO}/contents/comments/comments.xlsx",
+            headers=gh_headers(), timeout=15
+        )
+        if meta.status_code == 200:
+            sha     = meta.json()["sha"]
+            content = base64.b64decode(meta.json()["content"])
+            df      = pd.read_excel(BytesIO(content), engine="openpyxl")
+            if list(df.columns) != cols:
+                df = pd.DataFrame(columns=cols)
+        else:
+            sha = None
+            df  = pd.DataFrame(columns=cols)
+    except Exception:
+        sha = None
+        df  = pd.DataFrame(columns=cols)
+
+    df.loc[len(df)] = [ts, comment or "(пусто)"]
+
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as xls:
+        df.to_excel(xls, index=False)
+
+    gh_write(
+        "comments/comments.xlsx",
+        buf.getvalue(),
+        f"update comments.xlsx ({ts})",
+        sha=sha
+    )
+
+def save_comment(comment_text: str):
+
+    save_comment_json(comment_text)
+    save_comment_to_excel(comment_text)
+    return gr.update(value="Сохранено!", interactive=True)
+
+def save_prompt_json(llm, prompt_std, engagement_std):
+    ts = int(time.time())
+    payload = {
+        "timestamp": ts,
+        "llm": llm,
+        "prompt_engagement": prompt_std,
+        "engagement": engagement_std,
+    }
+    gh_write(
+        f"prompts/prompt_{ts}.json",
+        json.dumps(payload, ensure_ascii=False, indent=2).encode(),
+        f"add prompt {ts}"
+    )
+
+def save_prompt_to_excel(llm, prompt_std, engagement_std):
+    cols = ["timestamp", "llm",
+            "prompt_engagement",
+            "engagement"]
+    ts   = int(time.time())
+
+    try:
+        meta = requests.get(
+            f"https://api.github.com/repos/{REPO}/contents/prompts/prompts.xlsx",
+            headers=gh_headers(), timeout=15
+        )
+        if meta.status_code == 200:
+            sha     = meta.json()["sha"]
+            content = base64.b64decode(meta.json()["content"])
+            df      = pd.read_excel(BytesIO(content), engine="openpyxl")
+        else:
+            sha = None
+            df  = pd.DataFrame(columns=cols)
+    except Exception:
+        sha = None
+        df  = pd.DataFrame(columns=cols)
+
+    df.loc[len(df)] = [ts, llm, prompt_std, engagement_std]
+
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as xls:
+        df.to_excel(xls, index=False)
+
+    gh_write(
+        "prompts/prompts.xlsx",
+        buf.getvalue(),
+        f"update prompts.xlsx ({ts})",
+        sha=sha
+    )
+
+def save_prompts(llm, prompt_std, engagement_std):
+
+    try:
+        save_prompt_json(llm, prompt_std, engagement_std)
+        save_prompt_to_excel(llm, prompt_std, engagement_std)
+    except Exception as exc:
+        gr.Warning(f"Не удалось сохранить промпты: {exc}")
+
+def save_regenerate_json(section: str,
+                         prompt: str,
+                         old_resp: str,
+                         clarification: str,
+                         new_resp: str):
+
+    ts = int(time.time())
+    payload = {
+        "timestamp": ts,
+        "section": section,
+        "prompt": prompt,
+        "old_response": old_resp or "(пусто)",
+        "clarification": clarification or "(пусто)",
+        "new_response": new_resp or "(пусто)"
+    }
+    gh_write(
+        f"{REGENERATES_DIR}/regenerate_{ts}.json",
+        json.dumps(payload, ensure_ascii=False, indent=2).encode(),
+        f"add regenerate {ts}"
+    )
+
+def save_regenerate_to_excel(section: str,
+                             prompt: str,
+                             old_resp: str,
+                             clarification: str,
+                             new_resp: str):
+
+    cols = ["timestamp", "section",
+            "prompt", "old_response",
+            "clarification", "new_response"]
+    ts   = int(time.time())
+
+    try:
+        meta = requests.get(
+            f"https://api.github.com/repos/{REPO}/contents/{REGENERATES_DIR}/regenerates.xlsx",
+            headers=gh_headers(), timeout=15
+        )
+        if meta.status_code == 200:
+            sha     = meta.json()["sha"]
+            content = base64.b64decode(meta.json()["content"])
+            df      = pd.read_excel(BytesIO(content), engine="openpyxl")
+        else:
+            sha = None
+            df  = pd.DataFrame(columns=cols)
+    except Exception:
+        sha = None
+        df  = pd.DataFrame(columns=cols)
+
+    df.loc[len(df)] = [
+        ts, section, prompt,
+        old_resp or "(пусто)",
+        clarification or "(пусто)",
+        new_resp or "(пусто)"
+    ]
+
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as xls:
+        df.to_excel(xls, index=False)
+
+    gh_write(
+        f"{REGENERATES_DIR}/regenerates.xlsx",
+        buf.getvalue(),
+        f"update regenerates.xlsx ({ts})",
+        sha=sha
+    )
+
+def prepare_button_text():
+    return gr.update(value="Сохраняется...", interactive=True)
+
+def reset_button_text():
+    time.sleep(2)
+    return gr.update(value="Оставить комментарий", interactive=True)
+
+def ensure_period(text: str) -> str:
+
+    if not text:
+        return ""
+
+    stripped = text.strip()
+    if not stripped:
+        return ""
+
+    if stripped[-1] not in ".?!;":
+        stripped += "."
+    return stripped
+
+def make_header(name_s: str,
+                essence_s: str,
+                need_s: str,
+                cost_s: str) -> str:
+
+    lines = [f"продукта: {name_s}"]
+    if essence_s:
+        lines.append(f"Суть продукта: {essence_s}")
+    if need_s:
+        lines.append(f"Какую бизнес-потребность закрывает: {need_s}")
+    if cost_s:
+        lines.append(f"Стоимость продукта: {cost_s}")
+    return "\n".join(lines) + "\n"
+
+def build_all_prompts(
+    product_choice,
+    name, essence, task_essences, key_msg, benefit, advantage,
+    cost, design, func, biz
+):
+
+    name, essence, key_msg, benefit, advantage, cost, design, func, biz = [
+        ensure_period(t) for t in
+        [name, essence, key_msg, benefit, advantage, cost, design, func, biz]
+    ]
+
+    product_choice = (product_choice or "").strip()
+
+    common_part = "".join([
+        _get_prompt_line("Суть продукта", essence),
+        _get_prompt_line("Ключевая информация", key_msg)
+    ])
+
+    advantages_part = "".join([
+        _get_prompt_line("Выгода от использования продукта", benefit),
+        _get_prompt_line("Конкурентные преимущества Сбера по продукту", advantage)
+    ])
+
+    common_hdr = (
+        f"для следующего продукта: {name}\n"
+        f"{common_part}"
+        "Выбери ТОЛЬКО САМУЮ ВАЖНУЮ информацию для абзаца. Каждое слово на счету. "
+        "НИ В КОЕМ СЛУЧАЕ не добавляй факты, которых нет в исходных данных.\n"
+    )
+    standard_prompt = ""
+
+    task_prompts = []
+    parsed_tasks = []
+    if not _is_blank(task_essences):
+        parsed_tasks = parse_task_essences(task_essences)
+
+    if parsed_tasks:
+        structure_tasks = (
+            "Структура абзаца:\n"
+            "1. Начни с утвердительного предложения с эмпатичным признанием ситуации клиента: кратко обозначь актуальную трудность и как она мешает целям/отнимает ресурсы. Первое слово — существительное или прилагательное. Запрещены «?», вопросительные слова («как», «почему», «зачем», «когда», «где», «ли») и обращения ко 2-му лицу («вы/вам/ваш») в первом предложении. Заверши точкой.\n"
+            "2. Продолжи заботливым, ненавязчивым предложением помощи: опиши поддерживающий подход/принцип как способ смягчить трудность, укажи конкретную выгоду для клиента и ОБЯЗАТЕЛЬНО добавь следующую информацию о клиенте: {task_essence}\n"
+            "3. Заверши открытым вопросом, как клиент сейчас решает обозначенную трудность и что именно хотелось бы улучшить; не уточняй, что с помощью нашего сервиса.\n"
+        )
+
+        for task_essence in parsed_tasks:
+            task_prompt = (
+                f"Напиши предельно вовлекающий и лаконичный абзац из 2-3 предложений (не более 4) суммарной длиной "
+                f"**строго не более 300 знаков с пробелами** для голосового скрипта {common_hdr}\n"
+                f"{structure_tasks.format(task_essence=task_essence)}"
+                "Стиль – деловой, без восклицаний.\n"
+                "Убедись, что включил информацию о клиенте в ответ.\n"
+                "Убедись, что все факты в ответе соответствуют исходным данным.\n"
+                "Ответь только требуемым абзацем."
+            )
+            task_prompts.append(task_prompt)
+
+        standard_prompt = (
+            f"Напиши предельно вовлекающий и лаконичный абзац из 2-3 предложений (не более 4) суммарной длиной "
+            f"**строго не более 300 знаков с пробелами** для голосового скрипта {common_hdr}\n"
+            "Структура абзаца:\n"
+            "1. Начни с утвердительного предложения с эмпатичным признанием ситуации клиента: кратко обозначь актуальную трудность и как она мешает целям/отнимает ресурсы. Первое слово — существительное или прилагательное. Запрещены «?», вопросительные слова («как», «почему», «зачем», «когда», «где», «ли») и обращения ко 2-му лицу («вы/вам/ваш») в первом предложении. Заверши точкой.\n"
+            "2. Продолжи заботливым, ненавязчивым предложением помощи: опиши поддерживающий подход/принцип как способ смягчить трудность, укажи конкретную выгоду для клиента.\n"
+            "3. Заверши открытым вопросом, как клиент сейчас решает обозначенную трудность и что именно хотелось бы улучшить; не уточняй, что с помощью нашего сервиса.\n"
+            "Стиль – деловой, без восклицаний.\n"
+            "Убедись, что все факты в ответе соответствуют исходным данным.\n"
+            "Ответь только требуемым абзацем."
+        )
+    else:
+        if product_choice.upper().startswith("ОТР"):
+            standard_prompt = (
+                f"Напиши предельно вовлекающий и лаконичный абзац из 2-3 предложений (не более 4) суммарной длиной "
+                f"**строго не более 300 знаков с пробелами** для голосового скрипта {common_hdr}\n"
+                "Структура абзаца:\n"
+                "1. Начни с «Я эксперт» (и укажи отрасль, которой принадлежит предлагаемый продукт).\n"
+                "2. Свяжи продукт с решением проблемы: один факт из данных, без оценочных слов и перечислений.\n"
+                "3. Задай один короткий вопрос о текущем процессе/боли клиента, сформулированный из главной задачи (напр.: «Как вы сейчас [действие]?», «Что мешает [цель]?». Если достаточно 2 предложений, объедини 1) и 2), а вопрос сделай вторым.\n"
+                "Стиль – деловой, без восклицаний.\n"
+                "Убедись, что все факты в ответе соответствуют исходным данным.\n"
+                "Ответь только требуемым абзацем."
+            )
+        else:
+            standard_prompt = (
+                f"Напиши один вопрос **строго не более 300 знаков с пробелами** для голосового скрипта для следующего продукта: {name}\n"
+                f"{_get_prompt_line('Суть продукта', essence)}"
+                f"{_get_prompt_line('Ключевая информация', key_msg)}"
+                "Нужно спросить клиента, планирует ли он воспользоваться продуктом – можно начать с «Рассматриваете ли Вы», "
+                "«Возможно, Вы планировали», «Планируете ли», «Подскажите, пожалуйста»."
+            )
+
+    while len(task_prompts) < 18:
+        task_prompts.append("")
+
+    adv1 = (
+        f"Напиши предельно вовлекающий и лаконичный абзац из 3-4 предложений (не более 5) суммарной длиной "
+        f"**строго не более 500 знаков с пробелами** для голосового скрипта "
+        f"для следующего продукта: {name}\n"
+        f"{_get_advantage1_content(advantage, benefit, essence)}"
+        "Выбери ТОЛЬКО САМУЮ ВАЖНУЮ информацию для абзаца. Каждое слово на счету. НИ В КОЕМ СЛУЧАЕ не добавляй факты, которых нет в исходных данных.\n"
+        "Стиль – деловой, без восклицаний.\n"
+        "Убедись, что все факты в ответе соответствуют исходным данным.\n"
+        "Ответь только требуемым абзацем."
+    )
+
+    adv2 = (
+        f"Напиши предельно вовлекающий и лаконичный абзац из 3-4 предложений (не более 5) суммарной длиной "
+        f"**строго не более 500 знаков с пробелами** для голосового скрипта "
+        f"для следующего продукта: {name}\n"
+        f"{_get_advantage2_content(func, benefit, essence)}"
+        "Выбери ТОЛЬКО САМУЮ ВАЖНУЮ информацию для абзаца. Каждое слово на счету. НИ В КОЕМ СЛУЧАЕ не добавляй факты, которых нет в исходных данных.\n"
+        "Стиль – деловой, без восклицаний.\n"
+        "Убедись, что все факты в ответе соответствуют исходным данным.\n"
+        "Ответь только требуемым абзацем."
+    )
+
+    if _is_blank(cost):
+        cost_prompt = "Промпт для стоимости не сформирован, поскольку в брифе отсутствует информация о стоимости."
+    else:
+        cost_prompt = (
+            f"Напиши лаконичный абзац про стоимость продукта из 1-2 предложений (не более 2) суммарной длиной "
+            f"**строго не более 300 знаков с пробелами** для голосового скрипта "
+            f"для следующего продукта: {name}\n"
+            f"{_get_prompt_line('Суть продукта', essence)}"
+            f"{_get_prompt_line('Стоимость продукта', cost)}"
+            "Стиль – деловой, без восклицаний.\n"
+            "Убедись, что все факты в ответе соответствуют исходным данным.\n"
+            "Заверши фразой, укрепляющей уверенность в выгодности продукта.\n"
+            "Ответь только требуемым абзацем."
+        )
+
+    if _is_blank(design):
+        design_prompt = "Промпт для оформления не сформирован, поскольку в брифе отсутствует информация об оформлении."
+    else:
+        design_prompt = (
+            f"Напиши лаконичный абзац про оформление продукта из 1-2 предложений (не более 2) суммарной длиной "
+            f"**строго не более 300 знаков с пробелами** для голосового скрипта "
+            f"для следующего продукта: {name}\n"
+            f"{_get_prompt_line('Суть продукта', essence)}"
+            f"{_get_prompt_line('Оформление продукта', design)}"
+            "Стиль – деловой, без восклицаний.\n"
+            "Если в инструкции по оформлению несколько пунктов, ОБЯЗАТЕЛЬНО используй нумерацию.\n"
+            "Убедись, что все факты в ответе соответствуют исходным данным.\n"
+            "Заверши фразой, укрепляющей уверенность в выгодности продукта.\n"
+            "Ответь только требуемым абзацем."
+        )
+
+    obj_detect = (
+        "Придумай 6 различных коротких возражений **строго не более 5 слов каждое**, которые может выдвинуть клиент, "
+        f"когда ему предлагается приобрести или оформить следующий продукт: {name}\n"
+        f"{_get_prompt_line('Суть продукта', essence)}"
+        f"{_get_prompt_line('Функционал продукта', func)}"
+        f"{_get_prompt_line('Информация о бизнесе клиента', biz)}"
+        "Ответь строго в виде нумерованного списка из 6 различных коротких возражений."
+    )
+
+    return [
+        gr.update(value=p, interactive=True)
+        for p in [standard_prompt, adv1, adv2, cost_prompt, design_prompt, obj_detect]
+    ] + [gr.update(value=p, interactive=True) for p in task_prompts]
+
+def update_prompts(*args):
+
+    return build_all_prompts(*args)
+
+def clear_engagements():
+
+    return [gr.update(value="")] * 2
+
+def update_task_visibility(task_essences_value):
+
+    parsed_tasks = parse_task_essences(task_essences_value) if task_essences_value else []
+    num_tasks = len(parsed_tasks) if parsed_tasks else 0
+
+    prompt_row_updates = []
+    for i in range(6):
+
+        start_task = i * 3 + 1
+        has_tasks = start_task <= num_tasks
+        prompt_row_updates.append(gr.update(visible=has_tasks))
+
+    prompt_field_updates = []
+    for i in range(18):
+        task_num = i + 1
+        is_visible = task_num <= num_tasks
+        prompt_field_updates.append(gr.update(visible=is_visible))
+
+    result_row_updates = []
+    for i in range(18):
+        task_num = i + 1
+        is_visible = task_num <= num_tasks
+        result_row_updates.append(gr.update(visible=is_visible))
+
+    result_field_updates = []
+    for i in range(18):
+        task_num = i + 1
+        is_visible = task_num <= num_tasks
+        result_field_updates.append(gr.update(visible=is_visible))
+
+    button_updates = []
+    for i in range(18):
+        task_num = i + 1
+        is_visible = task_num <= num_tasks
+        button_updates.append(gr.update(visible=is_visible))
+
+    clarification_updates = []
+    for i in range(18):
+        task_num = i + 1
+        is_visible = task_num <= num_tasks
+        clarification_updates.append(gr.update(visible=is_visible))
+
+    return (prompt_row_updates + prompt_field_updates +
+            result_row_updates + result_field_updates +
+            button_updates + clarification_updates)
+
+def validate_product_name(product_name_val: str):
+
+    if _is_blank(product_name_val):
+
+        raise gr.Warning("Вы не указали название продукта. Генерация скрипта продолжится по имеющимся данным.")
+
+with gr.Blocks(theme=gr.themes.Default()) as demo:
+    with gr.Tabs() as tabs:
+
+        with gr.TabItem("Бриф",id=0):
+            with gr.Row():
+                btn_choose   = gr.Button("Загрузить файл (.xlsx)", visible=False)
+                btn_template = gr.Button("Скачать шаблон", visible=False)
+            template_holder = gr.File(visible=False)
+            file_uploader = gr.File(label="Выберите .xlsx", file_types=[".xlsx"], visible=False)
+
+            with gr.Row():
+                with gr.Column(scale=1):
+                  product_list = gr.Dropdown(
+                      [
+                          "Свой продукт",
+                          "Юkassa",
+                          "Купер",
+                          "ОТР Купер (тест ОТР)",
+                          "Лизинг",
+                          "СберБизнес Карта Supreme",
+                          "СберЛид",
+                          "СберБизнесБот",
+                          "СберТаргет",
+                          "ЮДБ",
+			  "СберБизнесЖКХ"
+                      ],
+                      value="Свой продукт",
+                      label="Список продуктов",
+                      interactive=True
+                  )
+                with gr.Column(scale=1):
+                    product_name = gr.Textbox(label="Название продукта", interactive=True)
+                with gr.Column(scale=1):
+                    product_essence = gr.Textbox(label="Суть продукта", interactive=True)
+
+            boxes = []
+            labels = TEMPLATE_ORDER[2:]
+
+            for i in range(0, len(labels), 3):
+                with gr.Row():
+                    for lbl in labels[i:i+3]:
+                        with gr.Column(scale=1):
+                            tb = gr.Textbox(label=lbl, interactive=True)
+                            boxes.append(tb)
+
+                            if lbl == "Бизнес-потребность":
+                                business_need_tb = tb
+                            elif lbl == "Стоимость":
+                                product_cost_tb = tb
+                            elif lbl == "Ключевое сообщение":
+                                key_msg_tb = tb
+                            elif lbl == "Выгода от использования продукта":
+                                benefit_tb = tb
+                            elif lbl == "Конкурентные преимущества Сбера по продукту":
+                                advantage_tb = tb
+                            elif lbl == "Функционал продукта":
+                                func_tb = tb
+                            elif lbl == "Информация о бизнесе клиента":
+                                biz_info_tb = tb
+                            elif lbl == "Оформление":
+                                design_tb = tb
+                            elif lbl == "Суть задач":
+                                task_essences_tb = tb
+
+            boxes.insert(0, product_essence)
+            boxes.insert(0, product_name)
+
+            FIELD_BOXES = {
+                "Название продукта": product_name,
+                "Суть продукта":     product_essence,
+            }
+            for lbl, tb in zip(labels, boxes[2:]):
+                FIELD_BOXES[lbl] = tb
+
+            btn_to_prompts = gr.Button("Перейти к промптам для формирования скрипта")
+
+        with gr.TabItem("Промпты", id=1):
+
+            task_prompt_rows = []
+            task_prompts = []
+            for i in range(0, 18, 3):
+                row = gr.Row(visible=False)
+                task_prompt_rows.append(row)
+                with row:
+                    for j in range(3):
+                        if i + j + 1 <= 18:
+                            prompt_box = gr.Textbox(
+                                label=f"Промпт для вовлечения (суть задачи {i + j + 1})",
+                                lines=33,
+                                visible=False
+                            )
+                            task_prompts.append(prompt_box)
+
+            with gr.Row():
+                prompt_eng_standard = gr.Textbox(
+                    label="Промпт для вовлечения (стандартный)",
+                    lines=22
+                )
+
+            with gr.Row():
+                generate_engagements_btn = gr.Button("Сгенерировать только вовлечения")
+
+            with gr.Row():
+                prompt_adv1 = gr.Textbox(
+                    label="Промпт для преимуществ 1",
+                    lines=30,
+                    interactive=False
+                )
+                prompt_adv2 = gr.Textbox(
+                    label="Промпт для преимуществ 2",
+                    lines=30,
+                    interactive=False
+                )
+
+            with gr.Row():
+                prompt_cost = gr.Textbox(
+                    label="Промпт для стоимости",
+                    lines=12,
+                    interactive=False
+                )
+                prompt_format = gr.Textbox(
+                    label="Промпт для оформления",
+                    lines=12,
+                    interactive=False
+                )
+
+            with gr.Row():
+                prompt_obj_detect = gr.Textbox(
+                    label="Промпт для определения 6 возражений",
+                    lines=20, scale=3, interactive=False
+                )
+
+            eng_inputs = [
+                product_list,
+                product_name,
+                product_essence,
+                task_essences_tb,
+                key_msg_tb,
+                benefit_tb,
+                advantage_tb,
+                product_cost_tb,
+                design_tb,
+                func_tb,
+                biz_info_tb,
+            ]
+
+            for src in eng_inputs:
+                src.change(
+                    update_prompts,
+                    inputs=eng_inputs,
+                    outputs=[
+                        prompt_eng_standard,
+                        prompt_adv1, prompt_adv2,
+                        prompt_cost, prompt_format,
+                        prompt_obj_detect,
+                    ] + task_prompts,
+                )
+
+            task_essences_tb.change(
+                lambda x: update_task_visibility(x)[:24],
+                inputs=task_essences_tb,
+                outputs=task_prompt_rows + task_prompts,
+            )
+
+            with gr.Row(visible=False):
+                prompt_obj_llm1 = gr.Textbox(
+                    label="Промпт для работы с возражением LLM 1",
+                    lines=40,
+                    interactive=False,
+                )
+                prompt_obj_llm2 = gr.Textbox(
+                    label="Промпт для работы с возражением LLM 2",
+                    lines=40,
+                    interactive=False,
+                )
+                prompt_obj_llm3 = gr.Textbox(
+                    label="Промпт для работы с возражением LLM 3",
+                    lines=40,
+                    interactive=False,
+                )
+
+            with gr.Row(visible=False):
+                prompt_obj_llm4 = gr.Textbox(
+                    label="Промпт для работы с возражением LLM 4",
+                    lines=40,
+                    interactive=False,
+                )
+                prompt_obj_llm5 = gr.Textbox(
+                    label="Промпт для работы с возражением LLM 5",
+                    lines=40,
+                    interactive=False,
+                )
+                prompt_obj_llm6 = gr.Textbox(
+                    label="Промпт для работы с возражением LLM 6",
+                    lines=40,
+                    interactive=False,
+                )
+
+            LLM_PROMPT_BOXES = [
+                prompt_obj_llm1, prompt_obj_llm2, prompt_obj_llm3,
+                prompt_obj_llm4, prompt_obj_llm5, prompt_obj_llm6,
+            ]
+
+            llm = gr.Dropdown(
+                ["GigaChat-2-Max", "GigaChat-2-Pro", "GigaChat-Max (до 1 июля)",
+                 "ChatGPT-4o"],
+                value="GigaChat-2-Max",
+                label="Выбрать LLM",
+                interactive=True
+            )
+            btn_to_script = gr.Button("Сформировать скрипт")
+
+        with gr.TabItem("Скрипт", id=2):
+            frozen = {
+            }
+
+            script_boxes = {}
+            eng_boxes = {}
+            clar_boxes = {}
+
+            task_result_rows = []
+            task_result_boxes = []
+            task_result_buttons = []
+            task_result_clarifications = []
+
+            for i in range(1, 19):
+                with gr.Row(visible=False) as row:
+                    task_result_rows.append(row)
+                    sec_name = f"Вовлечение (суть задачи {i})"
+
+                    with gr.Column(scale=1):
+                        sbox = gr.Textbox(
+                            label=sec_name,
+                            lines=11,
+                            interactive=True,
+                            visible=False
+                        )
+                        task_result_boxes.append(sbox)
+                        eng_boxes[sec_name] = sbox
+
+                    with gr.Column(scale=1):
+                        regen = gr.Button(
+                            "Перегенерировать",
+                            variant="secondary",
+                            interactive=True,
+                            visible=False
+                        )
+                        task_result_buttons.append(regen)
+
+                    with gr.Column(scale=1):
+                        clar = gr.Textbox(
+                            label="Уточняющий промпт",
+                            lines=11,
+                            interactive=True,
+                            visible=False
+                        )
+                        task_result_clarifications.append(clar)
+                        clar_boxes[sec_name] = clar
+
+            task_essences_tb.change(
+                lambda x: update_task_visibility(x)[24:],
+                inputs=task_essences_tb,
+                outputs=(task_result_rows + task_result_boxes +
+                        task_result_buttons + task_result_clarifications),
+            )
+
+            REGEN_BUTTONS = {}
+            OBJ_ROWS = {}
+
+            HIDDEN_PROMPT_BOXES = {}
+
+            for i, regen in enumerate(task_result_buttons):
+                task_num = i + 1
+                sec_name = f"Вовлечение (суть задачи {task_num})"
+                REGEN_BUTTONS[sec_name] = regen
+
+            for sec in SCRIPT_SECTIONS:
+                locked = sec in frozen
+                is_obj = sec.startswith("Возражение")
+                obj_num = int(sec.split()[1]) if is_obj else 0
+
+                default_visible = (not is_obj) or (obj_num <= 6)
+                with gr.Row(visible=default_visible) as row:
+
+                    with gr.Column(scale=1):
+                        sbox = gr.Textbox(
+                            label=sec,
+                            lines=11,
+                            value=(""
+                                   if locked else ""),
+                            interactive=not locked,
+                        )
+                        script_boxes[sec] = sbox
+
+                    if sec.startswith("Вовлечение"):
+                        eng_boxes[sec] = sbox
+
+                    with gr.Column(scale=1):
+                        regen = gr.Button(
+                            "Перегенерировать",
+                            variant="secondary",
+                            interactive=not locked,
+                        )
+                        REGEN_BUTTONS[sec] = regen
+
+                    with gr.Column(scale=1):
+                        clar = gr.Textbox(
+                            label="Уточняющий промпт",
+                            lines=11,
+                            interactive=not locked,
+                        )
+
+                    clar_boxes[sec] = clar
+
+                    if is_obj:
+                        HIDDEN_PROMPT_BOXES[sec] = gr.Textbox(visible=False)
+
+                if is_obj:
+                    OBJ_ROWS[sec] = row
+
+            PROMPT_MAP = {
+                "Вовлечение 1":  prompt_eng_standard,
+                "Преимущества 1": prompt_adv1,
+                "Преимущества 2": prompt_adv2,
+                "Стоимость":      prompt_cost,
+                "Оформление":     prompt_format,
+            }
+
+            for i in range(18):
+                task_num = i + 1
+                sec_name = f"Вовлечение (суть задачи {task_num})"
+                PROMPT_MAP[sec_name] = task_prompts[i]
+
+            for sec in (
+                "Вовлечение 1",
+                "Преимущества 1", "Преимущества 2", "Стоимость", "Оформление"
+            ):
+                REGEN_BUTTONS[sec].click(
+                    refine_section,
+                    inputs=[
+                        llm,
+                        PROMPT_MAP[sec],
+                        script_boxes[sec],
+                        clar_boxes[sec],
+
+                        product_essence, key_msg_tb, benefit_tb,
+                        advantage_tb, product_cost_tb, design_tb,
+                        func_tb, biz_info_tb
+                    ],
+                    outputs=[script_boxes[sec], clar_boxes[sec]],
+                    queue=True
+                )
+
+            for i in range(18):
+                task_num = i + 1
+                sec_name = f"Вовлечение (суть задачи {task_num})"
+                if sec_name in REGEN_BUTTONS:
+                    REGEN_BUTTONS[sec_name].click(
+                        refine_section,
+                        inputs=[
+                            llm,
+                            PROMPT_MAP[sec_name],
+                            eng_boxes[sec_name],
+                            clar_boxes[sec_name],
+
+                            product_essence, task_essences_tb, key_msg_tb, benefit_tb,
+                            advantage_tb, product_cost_tb, design_tb,
+                            func_tb, biz_info_tb
+                        ],
+                        outputs=[eng_boxes[sec_name], clar_boxes[sec_name]],
+                        queue=True
+                    )
+
+            for i in range(1, MAX_OBJS+1):
+                sec = f"Возражение {i}"
+                REGEN_BUTTONS[sec].click(
+                    refine_llm_objection,
+                    inputs=[
+                        llm,
+                        HIDDEN_PROMPT_BOXES[sec],
+                        script_boxes[sec],
+                        clar_boxes[sec],
+                    ],
+                    outputs=[script_boxes[sec], clar_boxes[sec]],
+                    queue=True
+                )
+
+            with gr.Row():
+
+                with gr.Column(scale=1):
+                    btn_export  = gr.Button("Экспортировать скрипт (.xlsx)")
+                    file_export = gr.File(visible=False)
+
+                with gr.Column(scale=1):
+                    btn_export_json  = gr.Button("Экспортировать скрипт (.json)")
+                    file_export_json = gr.File(visible=False)
+
+        with gr.TabItem("Обратная связь", id=3):
+            feedback_box = gr.Textbox(
+                label="Книга жалоб и предложений по программе",
+                lines=8
+            )
+            submit_feedback = gr.Button("Оставить комментарий")
+
+        with gr.TabItem("Changelog", id=4):
+            gr.Markdown("""
+            **24.07.2025. Voice_Script_v1.0.**
+            """)
+
+        with gr.TabItem("Схема", id=5):
+            scheme_img = gr.Image(
+                value=gh_image("scheme.png"),
+                label="Схема",
+                interactive=False,
+            )
+
+        with gr.TabItem("Сбор", id=6):
+            gr.Markdown("**Данная вкладка предназначена только для сбора эталонных вовлечений**")
+
+            url_input = gr.Textbox(
+                label="Ссылка",
+                placeholder="Вставьте URL-ссылку",
+                interactive=True
+            )
+
+            with gr.Row():
+                parse_btn = gr.Button("Парсить")
+                gr.Markdown("⚠️ *В случае неуспешного парсинга какой-либо страницы оставьте об этом комментарий на вкладке «Обратная связь» или свяжитесь с Акимовым Д. – кейс будет изучен, алгоритмы парсинга откорректированы*")
+
+            page_content = gr.Textbox(
+                label="Содержимое страницы",
+                lines=10,
+                interactive=True
+            )
+
+            with gr.Row():
+                prompt_expert = gr.Textbox(
+                    label="Промпт \"Я эксперт\"",
+                    lines=5,
+                    interactive=True
+                )
+                prompt_problem = gr.Textbox(
+                    label="Промпт \"Через проблему\"",
+                    lines=5,
+                    interactive=True
+                )
+                prompt_care = gr.Textbox(
+                    label="Промпт \"Через заботу\"",
+                    lines=5,
+                    interactive=True
+                )
+                prompt_questions = gr.Textbox(
+                    label="Промпт \"Через вопросы\"",
+                    lines=5,
+                    interactive=True
+                )
+
+            model_dropdown = gr.Dropdown(
+                choices=[
+                    "GPT-4o",
+                    "GigaChat-2-Max",
+                    "GPT-5",
+                    "Gemini-2.5 Pro",
+                    "Gemini-2.5 Flash",
+                    "Claude Opus 4.1",
+                    "Grok 4",
+                    "GLM 4.5",
+                    "DeepSeek-R1",
+                    "DeepSeek-V3.1",
+                    "Kimi-K2",
+                    "Qwen3-235B"
+                ],
+                value="GPT-4o",
+                label="Модель",
+                interactive=True
+            )
+
+            generate_all_btn = gr.Button("Сгенерировать все вовлечения")
+
+            with gr.Row():
+                generate_btn_1 = gr.Button("Сгенерировать")
+                generate_btn_2 = gr.Button("Сгенерировать")
+                generate_btn_3 = gr.Button("Сгенерировать")
+                generate_btn_4 = gr.Button("Сгенерировать")
+
+            with gr.Row():
+                engagement_expert = gr.Textbox(
+                    label="Вовлечение \"Я эксперт\"",
+                    lines=5,
+                    interactive=True
+                )
+                engagement_problem = gr.Textbox(
+                    label="Вовлечение \"Через проблему\"",
+                    lines=5,
+                    interactive=True
+                )
+                engagement_care = gr.Textbox(
+                    label="Вовлечение \"Через заботу\"",
+                    lines=5,
+                    interactive=True
+                )
+                engagement_questions = gr.Textbox(
+                    label="Вовлечение \"Через вопросы\"",
+                    lines=5,
+                    interactive=True
+                )
+
+            with gr.Row():
+                comment_1 = gr.Textbox(
+                    label="Уточняющий комментарий",
+                    lines=3,
+                    interactive=True
+                )
+                comment_2 = gr.Textbox(
+                    label="Уточняющий комментарий",
+                    lines=3,
+                    interactive=True
+                )
+                comment_3 = gr.Textbox(
+                    label="Уточняющий комментарий",
+                    lines=3,
+                    interactive=True
+                )
+                comment_4 = gr.Textbox(
+                    label="Уточняющий комментарий",
+                    lines=3,
+                    interactive=True
+                )
+
+            with gr.Row():
+                regen_btn_1 = gr.Button("Перегенерировать", variant="secondary")
+                regen_btn_2 = gr.Button("Перегенерировать", variant="secondary")
+                regen_btn_3 = gr.Button("Перегенерировать", variant="secondary")
+                regen_btn_4 = gr.Button("Перегенерировать", variant="secondary")
+
+    _openrouter = os.getenv("OPENROUTER_API_KEY")
+    _gpt5_key = os.getenv("OPENAI_GPT5_API_KEY")
+
+    additional_models = {
+
+        "Gemini-2.5 Pro": lambda: OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=_openrouter
+        ),
+        "Gemini-2.5 Flash": lambda: OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=_openrouter
+        ),
+        "Claude Opus 4.1": lambda: OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=_openrouter
+        ),
+        "Grok 4": lambda: OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=_openrouter
+        ),
+        "GLM 4.5": lambda: OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=_openrouter
+        ),
+
+        "GPT-4o": lambda: ChatOpenAI(api_key=_openai, model="gpt-4o"),
+        "GPT-5": lambda: ChatOpenAI(api_key=_gpt5_key, model="gpt-5"),
+        "DeepSeek-V3.1": lambda: ChatTogether(api_key=_together, model="deepseek-ai/DeepSeek-V3.1"),
+        "DeepSeek-R1": lambda: ChatTogether(api_key=_together, model="deepseek-ai/DeepSeek-R1"),
+        "Kimi-K2": lambda: ChatTogether(api_key=_together, model="moonshotai/Kimi-K2-Instruct-0905"),
+        "Qwen3-235B": lambda: ChatTogether(api_key=_together, model="Qwen/Qwen3-235B-A22B-Instruct-2507-tput"),
+    }
+
+    chat_pool.update(additional_models)
+
+    def generate_engagement(model_name, prompt):
+
+        try:
+
+            if model_name in ["Gemini-2.5 Pro", "Gemini-2.5 Flash", "Claude Opus 4.1", "Grok 4", "GLM 4.5"]:
+                model_mapping = {
+                    "Gemini-2.5 Pro": "google/gemini-2.5-pro",
+                    "Gemini-2.5 Flash": "google/gemini-2.5-flash",
+                    "Claude Opus 4.1": "anthropic/claude-opus-4.1",
+                    "Grok 4": "x-ai/grok-4",
+                    "GLM 4.5": "z-ai/glm-4.5"
+                }
+
+                if model_name not in chat_pool:
+                    return f"Неизвестная модель: {model_name}"
+
+                client = chat_pool[model_name]
+                if not hasattr(client, "chat"):
+                    client = client()
+                    chat_pool[model_name] = client
+
+                completion = client.chat.completions.create(
+                    extra_headers={
+                        "HTTP-Referer": "https://railway.app",
+                        "X-Title": "Voice Script Generator"
+                    },
+                    model=model_mapping[model_name],
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.7
+                )
+                result = completion.choices[0].message.content
+            else:
+
+                result = call_llm(model_name, prompt)
+
+            if model_name == "DeepSeek-R1" and result:
+                result = clean_response(result)
+
+            if result:
+                result = result.strip()
+
+            return result
+
+        except Exception as e:
+            return f"Ошибка генерации: {str(e)}"
+
+    def generate_prompts(page_content):
+
+        if not page_content or not page_content.strip():
+            return "", "", "", ""
+
+        base_template = """Напиши предельно вовлекающий и лаконичный абзац из 2-3 предложений (не более 4) суммарной длиной строго не более 300 знаков с пробелами для голосового скрипта для следующего продукта:
+
+"{content}"
+
+Выбери ТОЛЬКО САМУЮ ВАЖНУЮ информацию для абзаца. Каждое слово на счету. НИ В КОЕМ СЛУЧАЕ не добавляй факты, которых нет в исходных данных.
+
+Сначала отфильтруй входные данные (строго):
+— Определи главный продукт/сервис и используй только факты из его описания, свойств и блока «как использовать».
+— Игнорируй общесайтовые/технические элементы: баннеры (напр., про сертификаты НУЦ Минцифры), меню, кнопки («Подробнее», «Оставить заявку», «Перейти…»), сортировки, архивы, счётчики/время чтения, ссылки и посторонние разделы.
+— Если упомянуто несколько сущностей, выбери ту, что имеет определение продукта и описанные сценарии использования."""
+
+        expert_prompt = base_template + """
+
+Структура абзаца (строго соблюдай):
+1. Предложение 1 — самопозиционирование на основе данных: кратко обозначь роль/компетенцию или функциональную пользу для аудитории; допустима самопрезентация («Я эксперт по [тема]») или нейтральное позиционирование («Решение помогает…»). Только факты, без оценочных слов.
+2. Предложение 2 — свяжи продукт с решением: один факт/механика/результат из данных, без оценочных слов и перечислений.
+3. Предложение 3 — один короткий вопрос о текущем процессе/боли клиента, сформулированный из главной задачи (напр.: «Как вы сейчас [действие]?», «Что мешает [цель]?». Если достаточно 2 предложений, объедини 1) и 2), а вопрос сделай вторым.
+
+Стиль – деловой, без восклицаний.
+Убедись, что все факты в ответе соответствуют исходным данным.
+Ответь только требуемым абзацем."""
+
+        problem_prompt = base_template + """
+
+Структура абзаца (строго соблюдай):
+1. Предложение 1 — задай проблему клиента на основе данных: сжато и нейтрально опиши ключевую трудность аудитории и барьер/ограничение из исходных данных, без преувеличений и домыслов; формулировка произвольная, фактическая.
+2. Предложение 2 — свяжи продукт с решением: один факт/механика/результат из данных, без оценочных слов и перечислений.
+3. Предложение 3 — один короткий вопрос о текущем процессе/боли клиента, сформулированный из главной задачи (напр.: «Как вы сейчас [действие]?», «Что мешает [цель]?». Если достаточно 2 предложений, объедини 1) и 2), а вопрос сделай вторым.
+
+Стиль – деловой, без восклицаний.
+Убедись, что все факты в ответе соответствуют исходным данным.
+Ответь только требуемым абзацем."""
+
+        care_prompt = base_template + """
+
+Структура абзаца (строго соблюдай):
+1. Предложение 1 — сформулируй заботу: «Чтобы [аудитории] было проще/быстрее/безопаснее [ключевая задача], [продукт] помогает [1–2 самых важных действия/выгоды из данных]».
+2. Предложение 2 — один конкретный факт/функция/результат из данных, показывающий, как продукт снимает нагрузку или экономит время; без оценок и перечислений.
+3. Предложение 3 — один короткий вопрос о текущем процессе/боли клиента (напр.: «Как вы сейчас [действие]?», «Где тратите больше всего времени?»). Если достаточно 2 предложений, объедини 1) и 2), а вопрос сделай вторым.
+
+Стиль – деловой, без восклицаний.
+Убедись, что все факты в ответе соответствуют исходным данным.
+Ответь только требуемым абзацем."""
+
+        questions_prompt = base_template + """
+
+Структура абзаца (строго соблюдай):
+1. Предложение 1 — короткий уточняющий вопрос о релевантности: «Вы [аудитория/роль из данных] в [область продукта]?» или «Работаете с [задача/процесс из данных]?» (только термины из исходных данных).
+2. Предложение 2 — вопрос о главной боли/задаче: «Что сложнее всего в [ключевая задача из данных]?», «Какие задачи сейчас особенно остро?» или «Как вы сейчас [действие/процесс из данных]?» — один фокус.
+3. Предложение 3 (опционально) — вопрос о критерии/приоритете, связанный с ценностью продукта из данных: «Что для вас важнее в [процесс/результат из данных]?» или «По какому критерию выбираете [тип решения из данных]?».
+
+Стиль – деловой, без восклицаний.
+Убедись, что все факты в ответе соответствуют исходным данным.
+Ответь только требуемым абзацем."""
+
+        return (
+            expert_prompt.format(content=page_content),
+            problem_prompt.format(content=page_content),
+            care_prompt.format(content=page_content),
+            questions_prompt.format(content=page_content)
+        )
+
+    def generate_single_engagement(model_name, prompt_text, engagement_type):
+
+        if not prompt_text or not prompt_text.strip():
+            return f"Ошибка: Промпт для '{engagement_type}' пуст"
+
+        return generate_engagement(model_name, prompt_text)
+
+    def generate_all_engagements(model_name, prompt_expert, prompt_problem, prompt_care, prompt_questions):
+
+        results = []
+        engagement_types = ["Я эксперт", "Через проблему", "Через заботу", "Через вопросы"]
+        prompts = [prompt_expert, prompt_problem, prompt_care, prompt_questions]
+
+        for i, (engagement_type, prompt_text) in enumerate(zip(engagement_types, prompts)):
+            if not prompt_text or not prompt_text.strip():
+                results.append(f"Ошибка: Промпт для '{engagement_type}' пуст")
+            else:
+                result = generate_engagement(model_name, prompt_text)
+                results.append(result)
+
+        return tuple(results)
+
+    def refine_engagement(model_name, base_prompt, prev_answer, clarification):
+
+        try:
+            if not base_prompt or not base_prompt.strip():
+                return "Ошибка: Промпт не указан"
+
+            clarification = clarification.strip() if clarification else ""
+
+            if clarification:
+                full_prompt = build_refine_prompt(
+                    base_prompt, prev_answer or "", clarification
+                )
+            else:
+
+                full_prompt = base_prompt.strip()
+
+            result = generate_engagement(model_name, full_prompt)
+            return result
+
+        except Exception as e:
+            return f"Ошибка перегенерации: {str(e)}"
+
+    def refine_engagement_1(model_name, base_prompt, prev_answer, clarification):
+
+        return refine_engagement(model_name, base_prompt, prev_answer, clarification)
+
+    def refine_engagement_2(model_name, base_prompt, prev_answer, clarification):
+
+        return refine_engagement(model_name, base_prompt, prev_answer, clarification)
+
+    def refine_engagement_3(model_name, base_prompt, prev_answer, clarification):
+
+        return refine_engagement(model_name, base_prompt, prev_answer, clarification)
+
+    def refine_engagement_4(model_name, base_prompt, prev_answer, clarification):
+
+        return refine_engagement(model_name, base_prompt, prev_answer, clarification)
+
+    def parse_page(url):
+
+        if not url or not url.strip():
+            return "Ошибка: URL не указан"
+
+        try:
+
+            options = webdriver.ChromeOptions()
+            options.add_argument('--headless')
+            options.add_argument('--no-sandbox')
+            options.add_argument('--disable-dev-shm-usage')
+            options.add_argument('user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36')
+
+            service = ChromeService(ChromeDriverManager().install())
+            driver = webdriver.Chrome(service=service, options=options)
+
+            print(f"Загружаю страницу через Selenium: {url}")
+            driver.get(url)
+
+            WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.TAG_NAME, "h1")))
+
+            html = driver.page_source
+            driver.quit()
+
+            if html:
+
+                soup = BeautifulSoup(html, 'lxml')
+
+                for script in soup(["script", "style", "nav", "header", "footer"]):
+                    script.decompose()
+
+                text = soup.body.get_text(separator='\n', strip=True) if soup.body else soup.get_text(separator='\n', strip=True)
+
+                lines = [line.strip() for line in text.split('\n') if line.strip()]
+                cleaned_text = '\n'.join(lines)
+
+                return cleaned_text if cleaned_text else "Содержимое страницы не найдено"
+            else:
+                return "Не удалось получить содержимое страницы"
+
+        except Exception as selenium_error:
+            if 'driver' in locals():
+                try:
+                    driver.quit()
+                except:
+                    pass
+
+            print(f"Selenium не работает ({str(selenium_error)}), пробую requests...")
+
+            try:
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                    'Accept-Language': 'ru-RU,ru;q=0.8,en-US;q=0.5,en;q=0.3',
+                    'Accept-Encoding': 'gzip, deflate',
+                    'Connection': 'keep-alive',
+                    'Upgrade-Insecure-Requests': '1',
+                }
+
+                print(f"Загружаю страницу через requests: {url}")
+                response = requests.get(url, headers=headers, timeout=30, verify=False)
+                response.raise_for_status()
+
+                soup = BeautifulSoup(response.text, 'lxml')
+
+                for script in soup(["script", "style", "nav", "header", "footer"]):
+                    script.decompose()
+
+                text = soup.body.get_text(separator='\n', strip=True) if soup.body else soup.get_text(separator='\n', strip=True)
+
+                lines = [line.strip() for line in text.split('\n') if line.strip()]
+                cleaned_text = '\n'.join(lines)
+
+                return f"[Парсинг через requests]\n\n{cleaned_text}" if cleaned_text else "Содержимое страницы не найдено"
+
+            except Exception as requests_error:
+                return f"Ошибка парсинга:\nSelenium: {str(selenium_error)}\nRequests: {str(requests_error)}"
+
+    def generate_engagements_only(
+            llm_name: str,
+            p_eng_standard,
+            *task_prompts_and_srcs,
+        ):
+
+        task_prompts_list = list(task_prompts_and_srcs[:18])
+        srcs = task_prompts_and_srcs[18:]
+
+        task_essences_value = srcs[1] if len(srcs) > 1 else ""
+        parsed_tasks = parse_task_essences(task_essences_value) if task_essences_value else []
+        if parsed_tasks is None:
+            parsed_tasks = []
+        num_tasks = len(parsed_tasks)
+
+        for idx in range(num_tasks):
+            sec_name = f"Вовлечение (суть задачи {idx + 1})"
+            box = eng_boxes.get(sec_name)
+            if box is not None:
+                box.value = ""
+        eng_boxes["Вовлечение 1"].value = ""
+
+        task_updates = []
+        for i in range(num_tasks):
+            sec_name = f"Вовлечение-задача-{i + 1}"
+            gr.Info(f"Генерация блока «{sec_name}»...")
+            prompt_value = task_prompts_list[i]
+            txt = maybe_with_length(
+                retry_llm(llm_name, prompt_value, *srcs, max_len=MAX_LEN_ENGAGEMENT)
+            )
+            task_updates.append(gr.update(value=txt, interactive=True))
+
+        while len(task_updates) < 18:
+            task_updates.append(gr.update(value="", interactive=True))
+
+        gr.Info("Генерация блока «Вовлечение-1»...")
+        standard_text = maybe_with_length(
+            retry_llm(llm_name, p_eng_standard, *srcs, max_len=MAX_LEN_ENGAGEMENT)
+        )
+
+        gr.Info("✔️ Блоки вовлечений готовы.")
+
+        return task_updates + [gr.update(value=standard_text, interactive=True)]
+
+    def generate_script(
+            llm_name: str,
+            p_eng_standard,
+            p_adv1, p_adv2,
+            p_cost, p_format,
+            p_obj_detect,
+            *task_prompts_and_srcs
+        ):
+
+        task_prompts_list = list(task_prompts_and_srcs[:18])
+        srcs = task_prompts_and_srcs[18:]
+
+        task_essences_value = srcs[1] if len(srcs) > 1 else ""
+        parsed_tasks = parse_task_essences(task_essences_value) if task_essences_value else []
+        num_tasks = len(parsed_tasks) if parsed_tasks else 0
+
+        targets = []
+        prompts = []
+        sections = []
+
+        for i in range(num_tasks):
+            task_num = i + 1
+            sec_name = f"Вовлечение (суть задачи {task_num})"
+            targets.append(eng_boxes[sec_name])
+            prompts.append(task_prompts_list[i])
+            sections.append(f"Вовлечение-задача-{task_num}")
+
+        targets.append(eng_boxes["Вовлечение 1"])
+        prompts.append(p_eng_standard)
+        sections.append("Вовлечение-1")
+
+        targets.extend([
+            script_boxes["Преимущества 1"], script_boxes["Преимущества 2"],
+            script_boxes["Стоимость"], script_boxes["Оформление"],
+        ])
+        prompts.extend([p_adv1, p_adv2, p_cost, p_format])
+        sections.extend(["Преимущества-1", "Преимущества-2", "Стоимость", "Оформление"])
+
+        for tb in targets:
+            tb.value = ""
+
+        results = []
+        for sec, prm in zip(sections, prompts):
+            gr.Info(f"Генерация блока «{sec}»...")
+            if sec == "Стоимость" and prm.startswith("Промпт для стоимости"):
+                txt = "Блок не сформирован, поскольку в брифе отсутствует информация о стоимости."
+            elif sec == "Оформление" and prm.startswith("Промпт для оформления"):
+                txt = "Блок не сформирован, поскольку отсутствует информация об оформлении."
+            else:
+                if sec in ("Стоимость", "Оформление"):
+                    limit = MAX_LEN_COST_DESIGN
+                elif "Преимущества" in sec:
+                    limit = MAX_LEN_ADVANTAGES
+                elif "Вовлечение" in sec:
+                    limit = MAX_LEN_ENGAGEMENT
+                else:
+                    limit = MAX_LEN_GENERAL
+                txt = maybe_with_length(retry_llm(llm_name, prm, *srcs, max_len=limit))
+
+            results.append(txt)
+
+        gr.Info("✔️ Основные блоки скрипта готовы.")
+
+        task_updates = []
+
+        for i, txt in enumerate(results[:num_tasks]):
+            task_num = i + 1
+            if task_num % 3 == 0:
+                txt = f"[Забота] {txt}"
+            task_updates.append(gr.update(value=txt, interactive=True))
+
+        while len(task_updates) < 18:
+            task_updates.append(gr.update(value="", interactive=True))
+
+        remaining = results[num_tasks:]
+        standard_result = remaining[0] if remaining else ""
+        other_results = remaining[1:] if len(remaining) > 1 else []
+
+        standard_update = gr.update(value=standard_result, interactive=True)
+        other_updates = [gr.update(value=txt, interactive=True) for txt in other_results]
+
+        return tuple(task_updates + [standard_update] + other_updates)
+
+    def show_uploader():
+        return gr.update(visible=True)
+
+    def export_script(
+        product, eng_standard,
+        adv1, adv2, cost, formatting,
+        *task_and_obj_boxes
+    ):
+        rows = [
+            ("Название продукта", product),
+        ]
+
+        task_boxes = task_and_obj_boxes[:18]
+        obj_boxes = task_and_obj_boxes[18:]
+
+        for i, box in enumerate(task_boxes, 1):
+            text = strip_length(box)
+            if text:
+                rows.append((f"Вовлечение (суть задачи {i})", text))
+
+        rows.extend([
+            ("Вовлечение 1",   strip_length(eng_standard)),
+            ("Преимущества 1", strip_length(adv1)),
+            ("Преимущества 2", strip_length(adv2)),
+            ("Стоимость",      strip_length(cost)),
+            ("Оформление",     strip_length(formatting)),
+        ])
+
+        num = 1
+        for box in obj_boxes:
+            text = strip_length(box)
+            if text:
+                rows.append((f"Возражение {num}", text))
+                num += 1
+
+        wb = openpyxl.Workbook()
+        ws = wb.active
+
+        thin  = Side(style="thin")
+        border= Border(left=thin, right=thin, top=thin, bottom=thin)
+
+        for r, (k, v) in enumerate(rows, 1):
+            ws[f"A{r}"] = k
+            ws[f"A{r}"].font   = Font(bold=True)
+            ws[f"B{r}"] = v
+
+            for col in ("A", "B"):
+                ws[f"{col}{r}"].border = border
+
+        ws.column_dimensions["A"].width = 20
+        ws.column_dimensions["B"].width = 45
+
+        safe_name = re.sub(r"[^A-Za-zА-Яа-я0-9 _()-]", "", product).strip()
+        if not safe_name:
+            safe_name = "sales_script"
+        fname   = f"{safe_name}.xlsx"
+
+        tmp_dir = tempfile.mkdtemp()
+        path    = os.path.join(tmp_dir, fname)
+        wb.save(path)
+
+        safe_name = re.sub(r"[^A-Za-zА-Яа-я0-9 _()-]", "", product).strip() or "sales_script"
+        fname_local = f"{safe_name}.xlsx"
+
+        tmp_dir = tempfile.mkdtemp()
+        path    = os.path.join(tmp_dir, fname_local)
+        wb.save(path)
+
+        try:
+            unix = int(time.time())
+            fname_repo = f"{safe_name}_{unix}.xlsx"
+            with open(path, "rb") as f:
+                gh_write(
+                    f"exports/{fname_repo}",
+                    f.read(),
+                    msg=f"export {fname_repo}"
+                )
+        except Exception as e:
+
+            gr.Warning(f"Не удалось сохранить в GitHub: {e}")
+
+        return gr.update(value=path, visible=True)
+
+    def export_script_json(
+        product, eng_standard,
+        adv1, adv2, cost, formatting,
+        *task_and_obj_boxes
+    ):
+
+        from collections import OrderedDict
+        data = OrderedDict()
+        data["Название продукта"] = product
+
+        task_boxes = task_and_obj_boxes[:18]
+        obj_boxes = task_and_obj_boxes[18:]
+
+        for i, box in enumerate(task_boxes, 1):
+            txt = strip_length(box)
+            if txt:
+                data[f"Вовлечение (суть задачи {i})"] = txt
+
+        data["Вовлечение 1"] = strip_length(eng_standard)
+        data["Преимущества 1"] = strip_length(adv1)
+        data["Преимущества 2"] = strip_length(adv2)
+        data["Стоимость"] = strip_length(cost)
+        data["Оформление"] = strip_length(formatting)
+        data["Возражения"] = []
+
+        for box in obj_boxes:
+            txt = strip_length(box)
+            if txt:
+                data["Возражения"].append(txt)
+
+        safe_name = re.sub(r"[^A-Za-zА-Яа-я0-9 _()-]", "", product).strip() or "sales_script"
+        fname     = f"{safe_name}.json"
+        tmp_dir   = tempfile.mkdtemp()
+        path      = os.path.join(tmp_dir, fname)
+
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+        try:
+            unix = int(time.time())
+            fname_repo = f"{safe_name}_{unix}.json"
+            with open(path, "rb") as fbin:
+                gh_write(
+                    f"exports/{fname_repo}",
+                    fbin.read(),
+                    msg=f"export {fname_repo}"
+                )
+        except Exception as e:
+            gr.Warning(f"Не удалось сохранить JSON в GitHub: {e}")
+
+        return gr.update(value=path, visible=True)
+
+    btn_choose.click(show_uploader, outputs=file_uploader)
+    btn_template.click(download_template,outputs=template_holder)
+    product_list.change(
+            fill_fields,
+            inputs=product_list,
+            outputs=boxes
+    ).then(
+            update_prompts,
+            inputs=eng_inputs,
+            outputs=[
+                prompt_eng_standard,
+                prompt_adv1, prompt_adv2,
+                prompt_cost, prompt_format,
+                prompt_obj_detect,
+            ] + task_prompts,
+    ).then(
+        clear_engagements,
+        outputs=[
+            eng_boxes["Вовлечение 1"], clar_boxes["Вовлечение 1"],
+        ]
+    )
+    file_uploader.upload(upload_and_fill,inputs=file_uploader,outputs=boxes).then(
+        update_prompts,
+        inputs=eng_inputs,
+        outputs=[
+            prompt_eng_standard,
+            prompt_adv1, prompt_adv2,
+            prompt_cost, prompt_format,
+            prompt_obj_detect,
+        ] + task_prompts,
+    ).then(
+        clear_engagements,
+        outputs=[
+            eng_boxes["Вовлечение 1"], clar_boxes["Вовлечение 1"],
+        ]
+    )
+
+    generate_engagements_btn.click(
+        change_tab,
+        inputs=[gr.Number(value=2, visible=False)],
+        outputs=tabs,
+        queue=False,
+    ).then(
+        generate_engagements_only,
+        inputs=[
+            llm,
+            prompt_eng_standard,
+        ] + task_prompts + [
+            product_essence, task_essences_tb, key_msg_tb, benefit_tb,
+            advantage_tb, product_cost_tb, design_tb,
+            func_tb, biz_info_tb,
+        ],
+        outputs=task_result_boxes + [
+            eng_boxes["Вовлечение 1"],
+        ],
+        queue=True,
+    ).then(
+        fn=None,
+        js="() => window.requestAnimationFrame(()=>window.scrollTo(0,0))",
+        outputs=tabs,
+    )
+
+    btn_to_prompts.click(change_tab,inputs=[gr.Number(value=1,visible=False)],outputs=tabs)\
+                  .then(fn=None,js="() => window.requestAnimationFrame(()=>window.scrollTo(0,0))")
+
+    btn_to_script.click(
+        change_tab,
+        inputs=[gr.Number(value=2, visible=False)],
+        outputs=tabs
+    ).then(
+        fn=None,
+        js="() => window.requestAnimationFrame(()=>window.scrollTo(0,0))",
+        outputs=tabs
+    )
+
+    btn_to_script.click(
+        validate_product_name,
+        inputs=[product_name],
+        outputs=None,
+        queue=False,
+    ).then(
+        change_tab,
+        inputs=[gr.Number(value=2, visible=False)],
+        outputs=tabs,
+        queue=False,
+    ).then(
+        generate_script,
+        inputs=[
+            llm,
+            prompt_eng_standard,
+            prompt_adv1, prompt_adv2,
+            prompt_cost, prompt_format,
+            prompt_obj_detect,
+        ] + task_prompts + [
+            product_essence, task_essences_tb, key_msg_tb, benefit_tb,
+            advantage_tb, product_cost_tb, design_tb,
+            func_tb, biz_info_tb,
+        ],
+        outputs=task_result_boxes + [
+            eng_boxes["Вовлечение 1"],
+            script_boxes["Преимущества 1"], script_boxes["Преимущества 2"],
+            script_boxes["Стоимость"], script_boxes["Оформление"],
+        ],
+        queue=True,
+    ).then(
+
+        process_all_objections,
+        inputs=[
+            FIELD_BOXES["Возможные возражения клиента и ответы"],
+            llm,
+            prompt_obj_detect,
+            product_name,
+            product_essence,
+            func_tb,
+            benefit_tb,
+            FIELD_BOXES["Как эффективно применить продукт"],
+            product_cost_tb,
+            advantage_tb,
+            biz_info_tb,
+            key_msg_tb
+        ],
+        outputs=(
+            [OBJ_ROWS[f"Возражение {i}"] for i in range(1, MAX_OBJS + 1)] +
+            [script_boxes[f"Возражение {i}"] for i in range(1, MAX_OBJS + 1)] +
+            [REGEN_BUTTONS[f"Возражение {i}"] for i in range(1, MAX_OBJS + 1)] +
+            LLM_PROMPT_BOXES +
+            [HIDDEN_PROMPT_BOXES[f"Возражение {i}"] for i in range(1, MAX_OBJS + 1)]
+        ),
+        queue=True,
+    ).then(
+        save_prompts,
+        inputs=[
+            llm,
+            prompt_eng_standard,
+            eng_boxes["Вовлечение 1"],
+        ],
+        outputs=[],
+        queue=False,
+    )
+
+    btn_export.click(
+        export_script,
+        inputs=[
+            product_name,
+            script_boxes["Вовлечение 1"],
+            script_boxes["Преимущества 1"],
+            script_boxes["Преимущества 2"],
+            script_boxes["Стоимость"],
+            script_boxes["Оформление"],
+            *[eng_boxes[f"Вовлечение (суть задачи {i})"] for i in range(1, 19)],
+            *[script_boxes[f"Возражение {i}"] for i in range(1, MAX_OBJS + 1)]
+        ],
+        outputs=file_export,
+        queue=False,
+    )
+
+    btn_export_json.click(
+        export_script_json,
+        inputs=[
+            product_name,
+            script_boxes["Вовлечение 1"],
+            script_boxes["Преимущества 1"],
+            script_boxes["Преимущества 2"],
+            script_boxes["Стоимость"],
+            script_boxes["Оформление"],
+            *[eng_boxes[f"Вовлечение (суть задачи {i})"] for i in range(1, 19)],
+            *[script_boxes[f"Возражение {i}"] for i in range(1, MAX_OBJS + 1)]
+        ],
+        outputs=file_export_json,
+        queue=False,
+    )
+
+    submit_feedback.click(
+        prepare_button_text,
+        outputs=submit_feedback
+    ).then(
+        save_comment,
+        inputs=feedback_box,
+        outputs=submit_feedback
+    ).then(
+        reset_button_text,
+        outputs=submit_feedback,
+        queue=False
+    )
+
+    def parse_and_fill_prompts(url):
+
+        parsed_content = parse_page(url)
+
+        expert_p, problem_p, care_p, questions_p = generate_prompts(parsed_content)
+        return parsed_content, expert_p, problem_p, care_p, questions_p
+
+    parse_btn.click(
+        parse_and_fill_prompts,
+        inputs=url_input,
+        outputs=[page_content, prompt_expert, prompt_problem, prompt_care, prompt_questions],
+        queue=True
+    )
+
+    page_content.change(
+        generate_prompts,
+        inputs=page_content,
+        outputs=[prompt_expert, prompt_problem, prompt_care, prompt_questions],
+        queue=False
+    )
+
+    generate_all_btn.click(
+        generate_all_engagements,
+        inputs=[model_dropdown, prompt_expert, prompt_problem, prompt_care, prompt_questions],
+        outputs=[engagement_expert, engagement_problem, engagement_care, engagement_questions],
+        queue=True
+    )
+
+    generate_btn_1.click(
+        lambda model, prompt: generate_single_engagement(model, prompt, "Я эксперт"),
+        inputs=[model_dropdown, prompt_expert],
+        outputs=engagement_expert,
+        queue=True
+    )
+
+    generate_btn_2.click(
+        lambda model, prompt: generate_single_engagement(model, prompt, "Через проблему"),
+        inputs=[model_dropdown, prompt_problem],
+        outputs=engagement_problem,
+        queue=True
+    )
+
+    generate_btn_3.click(
+        lambda model, prompt: generate_single_engagement(model, prompt, "Через заботу"),
+        inputs=[model_dropdown, prompt_care],
+        outputs=engagement_care,
+        queue=True
+    )
+
+    generate_btn_4.click(
+        lambda model, prompt: generate_single_engagement(model, prompt, "Через вопросы"),
+        inputs=[model_dropdown, prompt_questions],
+        outputs=engagement_questions,
+        queue=True
+    )
+
+    regen_btn_1.click(
+        lambda model, prompt, prev_answer, clarification: (
+            refine_engagement_1(model, prompt, prev_answer, clarification),
+            ""
+        ),
+        inputs=[model_dropdown, prompt_expert, engagement_expert, comment_1],
+        outputs=[engagement_expert, comment_1],
+        queue=True
+    )
+
+    regen_btn_2.click(
+        lambda model, prompt, prev_answer, clarification: (
+            refine_engagement_2(model, prompt, prev_answer, clarification),
+            ""
+        ),
+        inputs=[model_dropdown, prompt_problem, engagement_problem, comment_2],
+        outputs=[engagement_problem, comment_2],
+        queue=True
+    )
+
+    regen_btn_3.click(
+        lambda model, prompt, prev_answer, clarification: (
+            refine_engagement_3(model, prompt, prev_answer, clarification),
+            ""
+        ),
+        inputs=[model_dropdown, prompt_care, engagement_care, comment_3],
+        outputs=[engagement_care, comment_3],
+        queue=True
+    )
+
+    regen_btn_4.click(
+        lambda model, prompt, prev_answer, clarification: (
+            refine_engagement_4(model, prompt, prev_answer, clarification),
+            ""
+        ),
+        inputs=[model_dropdown, prompt_questions, engagement_questions, comment_4],
+        outputs=[engagement_questions, comment_4],
+        queue=True
+    )
+
+if __name__ == "__main__":
+    demo.queue().launch(
+        server_name="0.0.0.0",
+        server_port=int(os.getenv("PORT", 7860)),
+        auth=[(USERNAME, PASSWORD)]
+    )
